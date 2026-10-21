@@ -12,13 +12,13 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use mlua::{Lua, Table, UserData, UserDataFields, UserDataMethods, Value, VmState};
-use vello::kurbo::{Affine, BezPath};
+use vello::kurbo::{Affine, BezPath, Rect};
 
 use crate::effects::{EffectDef, InputKind, Margin, UType};
 use crate::engine::{Engine, Raster};
@@ -51,12 +51,29 @@ fn lua_err(e: anyhow::Error) -> mlua::Error {
 
 /// "poster.luau:12" for the Lua code that called the current Rust function.
 fn caller(lua: &Lua) -> String {
-    lua.inspect_stack(1, |d| {
-        let src = d.source();
-        let file = src.short_src.as_deref().unwrap_or("?").to_string();
-        format!("{file}:{}", d.current_line().unwrap_or(0))
-    })
-    .unwrap_or_default()
+    lua.inspect_stack(1, |d| format!("{}:{}", chunk_file(&d.source()).unwrap_or("?"), d.current_line().unwrap_or(0))).unwrap_or_default()
+}
+
+/// A chunk's file: scripts and modules are named `@<path from the entry script's directory>`.
+fn chunk_file<'a>(src: &'a mlua::debug::DebugSource) -> Option<&'a str> {
+    src.source.as_deref().and_then(|s| s.strip_prefix('@')).or(src.short_src.as_deref())
+}
+
+/// `rel` as written in `file` (a chunk's file, or "" for the entry script's
+/// directory), as a path from the entry script's directory. Relative paths
+/// resolve from the file they're written in, so shared helpers work from any script.
+fn from_file(file: &str, rel: &str) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in Path::new(file).parent().unwrap_or(Path::new("")).join(rel).components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir if matches!(out.components().next_back(), Some(Component::Normal(_))) => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 pub fn run(eng: &Shared, entry: &Path, opts: &RunOptions) -> Result<RunResult> {
@@ -209,14 +226,55 @@ fn install(lua: &Lua, eng: &Shared, deps: &Deps, opts: &RunOptions) -> Result<()
         })?,
     )?;
 
-    // require("lib/brushes") loads lib/brushes.luau next to the entry script, once.
+    let (e, d) = (eng.clone(), deps.clone());
+    g.set(
+        "measure",
+        lua.create_function(move |lua, t: Table| {
+            let at = caller(lua);
+            let mut eng = e.borrow_mut();
+            let node = Conv { eng: &eng, deps: &d }.node(t).map_err(lua_err)?;
+            let Kind::Text(text) = node.kind else {
+                return Err(lua_err(anyhow!("{at}: measure expects a Text {{ ... }} element")));
+            };
+            let m = eng.fonts.measure(&text).map_err(|err| lua_err(anyhow!("{at}: measure: {err:#}")))?;
+            let rect = |r: Rect| -> mlua::Result<Table> {
+                let t = lua.create_table()?;
+                t.raw_set("x", r.x0)?;
+                t.raw_set("y", r.y0)?;
+                t.raw_set("w", r.width())?;
+                t.raw_set("h", r.height())?;
+                Ok(t)
+            };
+            let out = rect(m.advance)?;
+            out.raw_set("baseline", m.baseline)?;
+            out.raw_set("ascent", m.ascent)?;
+            out.raw_set("descent", m.descent)?;
+            let lines = lua.create_table()?;
+            for l in &m.lines {
+                let lt = lua.create_table()?;
+                lt.raw_set("x", l.x)?;
+                lt.raw_set("w", l.w)?;
+                lt.raw_set("baseline", l.baseline)?;
+                lines.raw_push(lt)?;
+            }
+            out.raw_set("lines", lines)?;
+            if let Some(ink) = m.ink {
+                out.raw_set("ink", rect(ink)?)?;
+            }
+            Ok(out)
+        })?,
+    )?;
+
+    // require("lib/brushes") loads lib/brushes.luau next to the requiring file, once.
     let (e, d) = (eng.clone(), deps.clone());
     let loaded: Rc<RefCell<HashMap<PathBuf, mlua::RegistryKey>>> = Rc::default();
     g.set(
         "require",
         lua.create_function(move |lua, name: String| {
+            let file = lua.inspect_stack(1, |d| chunk_file(&d.source()).unwrap_or("").to_string()).unwrap_or_default();
             let rel = if name.ends_with(".luau") || name.ends_with(".lua") { name.clone() } else { format!("{name}.luau") };
-            let path = e.borrow().resolve(rel.trim_start_matches("./")).map_err(lua_err)?;
+            let rel = from_file(&file, &rel).to_string_lossy().into_owned();
+            let path = e.borrow().resolve(&rel).map_err(lua_err)?;
             if let Some(key) = loaded.borrow().get(&path) {
                 return lua.registry_value::<Value>(key);
             }
@@ -382,6 +440,44 @@ fn color(v: &Value) -> Result<Rgba> {
 fn point(v: &Value) -> Result<[f64; 2]> {
     let Value::Table(t) = v else { bail!("expected {{x, y}}, got {}", type_name(v)) };
     Ok([length(&t.raw_get(1)?)?, length(&t.raw_get(2)?)?])
+}
+
+/// Where a `Group` or `Path` sits: `x y rotate scale` (translate · rotate · scale), or
+/// an explicit `transform = { a, b, c, d, e, f }` in SVG `matrix()` order, never both.
+fn placement(p: &Props) -> Result<[f64; 6]> {
+    let matrix = p.with("transform", |v| {
+        let Value::Table(t) = v else { bail!("expected {{ a, b, c, d, e, f }}, got {}", type_name(v)) };
+        let items: Vec<Value> = t.sequence_values::<Value>().collect::<mlua::Result<_>>()?;
+        if items.len() != 6 {
+            bail!("expected 6 values {{ a, b, c, d, e, f }} (x' = a x + c y + e, y' = b x + d y + f), got {}", items.len());
+        }
+        let mut m = [0.0; 6];
+        for (i, v) in items.iter().enumerate() {
+            // a..d are unitless; e, f are a translation, so they take lengths
+            m[i] = if i < 4 { number(v)? } else { length(v)? };
+        }
+        if m.iter().any(|v| !v.is_finite()) {
+            bail!("values must be finite, got {m:?}");
+        }
+        Ok(m)
+    })?;
+    if let Some(m) = matrix {
+        for k in ["x", "y", "rotate", "scale"] {
+            if !p.t.raw_get::<Value>(k)?.is_nil() {
+                return Err(p.err(format!("give either `transform` or `{k}`, not both (fold `{k}` into the matrix)")));
+            }
+        }
+        return Ok(m);
+    }
+    let (x, y) = (p.len_or("x", 0.0)?, p.len_or("y", 0.0)?);
+    let rotate = p.num("rotate")?.unwrap_or(0.0);
+    let (sx, sy) = p
+        .with("scale", |v| match v {
+            Value::Table(_) => Ok(point(v).map(|[a, b]| (a, b))?),
+            _ => number(v).map(|s| (s, s)),
+        })?
+        .unwrap_or((1.0, 1.0));
+    Ok((Affine::translate((x, y)) * Affine::rotate(rotate.to_radians()) * Affine::scale_non_uniform(sx, sy)).as_coeffs())
 }
 
 fn rect4(v: &Value) -> Result<[f64; 4]> {
@@ -643,8 +739,10 @@ impl Conv<'_> {
         Ok((fill, stroke))
     }
 
+    /// A path prop, resolved from the file whose code made the element.
     fn file(&self, p: &Props, rel: &str) -> Result<PathBuf> {
-        let path = self.eng.resolve(rel).map_err(|e| p.err(e))?;
+        let file = p.at.rsplit_once(':').map_or("", |(f, _)| f);
+        let path = self.eng.resolve(&from_file(file, rel).to_string_lossy()).map_err(|e| p.err(e))?;
         self.deps.borrow_mut().insert(path.clone());
         Ok(path)
     }
@@ -683,17 +781,9 @@ impl Conv<'_> {
         p.raw("id")?; // free-form label, kept out of the IR
         let kind = match op.as_str() {
             "Group" => {
-                let (x, y) = (p.len_or("x", 0.0)?, p.len_or("y", 0.0)?);
-                let rotate = p.num("rotate")?.unwrap_or(0.0);
-                let (sx, sy) = p
-                    .with("scale", |v| match v {
-                        Value::Table(_) => Ok(point(v).map(|[a, b]| (a, b))?),
-                        _ => number(v).map(|s| (s, s)),
-                    })?
-                    .unwrap_or((1.0, 1.0));
-                let xf = Affine::translate((x, y)) * Affine::rotate(rotate.to_radians()) * Affine::scale_non_uniform(sx, sy);
+                let transform = placement(&p)?;
                 let clip = p.with("clip", rect4)?;
-                Kind::Group { transform: xf.as_coeffs(), clip, children: self.child_nodes(&p)? }
+                Kind::Group { transform, clip, children: self.child_nodes(&p)? }
             }
             "Mask" => {
                 let shape_v = p.raw("shape")?.ok_or_else(|| p.err("missing `shape`"))?;
@@ -748,21 +838,15 @@ impl Conv<'_> {
                             (None, None) => return Err(p.err("missing `d` (SVG path data) or `points`")),
                         };
                         BezPath::from_svg(&d).map_err(|e| p.err(format!("bad path data: {e}")))?;
-                        let (x, y) = (p.len_or("x", 0.0)?, p.len_or("y", 0.0)?);
-                        let rotate = p.num("rotate")?.unwrap_or(0.0);
-                        let (sx, sy) = p
-                            .with("scale", |v| match v {
-                                Value::Table(_) => Ok(point(v).map(|[a, b]| (a, b))?),
-                                _ => number(v).map(|s| (s, s)),
-                            })?
-                            .unwrap_or((1.0, 1.0));
-                        let xf = Affine::translate((x, y)) * Affine::rotate(rotate.to_radians()) * Affine::scale_non_uniform(sx, sy);
-                        Geom::Path { d, transform: xf.as_coeffs() }
+                        Geom::Path { d, transform: placement(&p)? }
                     }
                 };
-                if op == "Line" && p.t.raw_get::<Value>("fill")? != Value::Nil {
-                    return Err(p.err("a Line has no area to fill; give it a `stroke`"));
+                for k in ["fill", "fillRule"] {
+                    if op == "Line" && p.t.raw_get::<Value>(k)? != Value::Nil {
+                        return Err(p.err(format!("a Line has no area to fill, so no `{k}`; give it a `stroke`")));
+                    }
                 }
+                let even_odd = p.choice("fillRule", &[("nonzero", false), ("evenodd", true)], false)?;
                 let (fill, mut stroke) = self.style(&p, op != "Line")?;
                 if op == "Line" {
                     stroke.get_or_insert(Stroke {
@@ -773,7 +857,7 @@ impl Conv<'_> {
                         dash: vec![],
                     });
                 }
-                Kind::Shape { geom, fill, stroke }
+                Kind::Shape { geom, fill, stroke, even_odd }
             }
             "Text" => {
                 let mut text = String::new();

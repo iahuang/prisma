@@ -27,7 +27,7 @@ fn render(example: &str, extra: &[&str]) -> image::RgbaImage {
 
 #[test]
 fn all_examples_render() {
-    for ex in ["basics", "poster", "halftone", "a-grid", "dracula", "outline", "sdf", "field", "type"] {
+    for ex in ["basics", "poster", "halftone", "a-grid", "dracula", "outline", "sdf", "field", "type", "transform", "logo"] {
         render(ex, &[]);
     }
 }
@@ -72,6 +72,8 @@ fn crop_matches_full_render() {
     assert_crop_matches("field", "180,300,60,60");
     // Gradient text and full-bleed paper noise.
     assert_crop_matches("type", "300,250,60,60");
+    // A sheared group's edge.
+    assert_crop_matches("transform", "590,290,80,60");
 }
 
 #[test]
@@ -129,6 +131,37 @@ fn type_pixels() {
 }
 
 #[test]
+fn transform_pixels() {
+    for scale in ["1", "2"] {
+        let img = render("transform", &["--scale", scale]);
+        let k: u32 = scale.parse().unwrap();
+        // transform = { 1, 0, 0.5, 1, 600, 300 } on a 40x40 square: row y' covers
+        // x' in [600 + 0.5 (y' - 300), 640 + 0.5 (y' - 300)].
+        let red = |x: u32, y: u32| {
+            let [r, g, b, _] = img.get_pixel(x * k, y * k).0;
+            r > 240 && g < 15 && b < 15
+        };
+        for (x, y, want) in [(630, 320, true), (605, 320, false), (655, 320, false), (650, 335, true), (612, 335, false), (603, 305, true)] {
+            assert_eq!(red(x, y), want, "scale {scale}: ({x}, {y}) red should be {want}");
+        }
+    }
+}
+
+#[test]
+fn measure_matches_layout() {
+    // The fixture asserts measure's numbers against anchor/align placement and
+    // draws a marker at the advance end of "HH".
+    let img = render_script("tests/fixtures/measure.luau", &[]);
+    // Helvetica H: advance 0.722 em, so "HH" at 80 px ends at 40 + 115.55; its ink spans 46.3..149.6.
+    let px = |x: u32| img.get_pixel(x, 70).0;
+    assert_eq!(px(44), [255, 255, 255, 255], "left side bearing");
+    assert_eq!(px(50)[..3], [0, 0, 0], "left stem");
+    assert_eq!(px(146)[..3], [0, 0, 0], "right stem");
+    assert_eq!(px(153), [255, 255, 255, 255], "right side bearing");
+    assert_eq!(px(157), [0, 0, 255, 255], "the marker starts where the advance ends");
+}
+
+#[test]
 fn named_effects_can_change_between_runs() {
     // A sweep reuses one engine, like watch mode; each cell redefines "solid" with different code.
     let img = render_script("tests/fixtures/sweep_effect.luau", &["--sweep", "v=0.2,0.8"]);
@@ -140,9 +173,109 @@ fn named_effects_can_change_between_runs() {
 fn paths_resolve_from_the_script_within_root() {
     let img = render_script("tests/fixtures/paths/sub/main.luau", &["--root", "tests/fixtures/paths"]);
     assert_eq!(img.get_pixel(5, 5).0, [0, 255, 0, 255]);
+    // A helper in another folder: its require and image paths resolve from the helper's file.
+    let img = render_script("tests/fixtures/paths/sub/shared.luau", &["--root", "tests/fixtures/paths"]);
+    assert_eq!(img.get_pixel(5, 2).0, [255, 0, 0, 255], "the helper's image");
+    assert_eq!(img.get_pixel(5, 8).0, [0, 0, 255, 255], "the helper's own require");
     let (_, out) = prisma("tests/fixtures/paths/sub/escape.luau", &["--root", "tests/fixtures/paths"]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success() && err.contains("outside the project directory"), "escape wasn't refused: {err}");
+}
+
+#[test]
+fn logo_pixels() {
+    let img = render("logo", &[]);
+    let (ink, bg) = ([0x1d, 0x35, 0x57, 0xff], [0xf4, 0xf1, 0xea, 0xff]);
+    // Even-odd, around the mark's center (190, 180): the ring is filled, the hole
+    // inside it is not (nonzero would fill it: both circles wind the same way),
+    // the bar is cut where it crosses the ring and filled inside and outside it.
+    for (x, y, want, what) in [
+        (190, 80, ink, "ring"),
+        (230, 140, bg, "hole"),
+        (190, 180, ink, "bar inside the hole"),
+        (290, 180, bg, "bar across the ring"),
+        (325, 180, ink, "bar outside the ring"),
+    ] {
+        assert_eq!(img.get_pixel(x, y).0, want, "{what} at {x},{y}");
+    }
+    // The construction is the same path unfilled.
+    assert_eq!(img.get_pixel(610, 140).0, bg);
+    assert_eq!(img.get_pixel(570 + 135, 180 - 10).0, bg, "inside the bar's outline");
+}
+
+fn overflow(case: &str, extra: &[&str]) -> (image::RgbaImage, String) {
+    let mut args = vec!["-p".to_string(), format!("case={case}")];
+    args.extend(extra.iter().map(|s| s.to_string()));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (out, o) = prisma("tests/fixtures/overflow.luau", &args);
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(o.status.success(), "{case}: {err}");
+    (image::open(out).unwrap().into_rgba8(), err)
+}
+
+const RED: [u8; 4] = [0xe8, 0x40, 0x2a, 0xff];
+const WHITE: [u8; 4] = [255, 255, 255, 255];
+
+#[test]
+fn nested_masks_fit_a_large_canvas() {
+    // Four masks deep over a 2400px canvas blanked the whole render when each
+    // mask's layers covered the canvas instead of the mask.
+    let (img, err) = overflow("masks", &[]);
+    assert!(!err.contains("warning"), "{err}");
+    assert_eq!(img.get_pixel(1200, 1200).0, RED);
+    assert_eq!(img.get_pixel(5, 5).0, WHITE);
+    // The inverted mask keeps its content outside the shape and cuts the hole.
+    assert_eq!(img.get_pixel(210, 300).0, RED);
+    assert_eq!(img.get_pixel(300, 300).0, WHITE);
+}
+
+#[test]
+fn overflowing_render_is_split() {
+    let (img, err) = overflow("crowd", &[]);
+    assert!(err.contains("warning: the scene overflowed vello's GPU buffers") && err.contains("rendered in pieces"), "{err}");
+    assert_eq!(img.get_pixel(1200, 1200).0, RED);
+    // The pieces join seamlessly: a crop across the first splits (x = 1200, then
+    // y = 1200 in each half) is small enough to render in one piece.
+    let (part, err) = overflow("crowd", &["--crop", "1100,1100,200,200"]);
+    assert!(!err.contains("warning"), "the crop overflowed too: {err}");
+    for (x, y, p) in part.enumerate_pixels() {
+        let q = img.get_pixel(1100 + x, 1100 + y);
+        let diff = p.0.iter().zip(q.0).map(|(a, b)| a.abs_diff(b)).max().unwrap();
+        assert!(diff <= 2, "pixel {x},{y} differs: {:?} vs {:?}", p.0, q.0);
+    }
+}
+
+#[test]
+fn overflow_that_splitting_cant_fix_fails() {
+    let (_, o) = prisma("tests/fixtures/overflow.luau", &["-p", "case=lines"]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && err.contains("line segments") && err.contains("can't help"), "{err}");
+}
+
+#[test]
+fn images_bigger_than_the_atlas_draw() {
+    // A 600x12000 page, then read back whole (scaled to a tenth) and as a 1:1 crop.
+    let (page, o) = prisma("tests/fixtures/big.luau", &["-p", "case=page"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let src = format!("src={}", page.display());
+    let img = render_script("tests/fixtures/big.luau", &["-p", "case=view", "-p", &src, "--root", "/"]);
+    for (y, want) in [(50, [255, 0, 0, 255]), (150, [0, 255, 0, 255]), (250, [0, 0, 255, 255]), (1010, [0, 0, 0, 255])] {
+        assert_eq!(img.get_pixel(30, y).0, want, "whole page at y = {y}");
+    }
+    // The crop starts at source (100, 9900): the square's left edge lands at x = 250.
+    assert_eq!(img.get_pixel(110, 50).0, [255, 0, 0, 255]);
+    assert_eq!(img.get_pixel(110, 300).0, [0, 255, 0, 255]);
+    assert_eq!(img.get_pixel(249, 200).0, [0, 255, 0, 255]);
+    assert_eq!(img.get_pixel(250, 200).0, [0, 0, 0, 255]);
+}
+
+#[test]
+fn passes_bigger_than_the_atlas_draw() {
+    // A blur's texture is 10000px tall; vello drops an image that size, so it goes back in tiles.
+    let img = render_script("tests/fixtures/big.luau", &["-p", "case=tallblur"]);
+    for y in [500, 8000, 8300, 9800] {
+        assert_eq!(img.get_pixel(200, y).0, [0, 0, 255, 255], "y = {y}");
+    }
 }
 
 #[test]
@@ -222,6 +355,8 @@ fn explicit_rules_reject() {
         ("opacity_range", &[][..], "`opacity` must be between 0 and 1, got 1.5"),
         ("blur_negative", &[][..], "`blur` can't be negative"),
         ("line_fill", &[][..], "a Line has no area to fill"),
+        ("line_fill_rule", &[][..], "a Line has no area to fill, so no `fillRule`"),
+        ("fill_rule", &[][..], "\"winding\" is not one of nonzero, evenodd"),
         ("align_unboxed", &[][..], "`align` places lines inside a box: set `w`, or use `anchor`"),
         ("anchor_boxed", &[][..], "with `w`, use `align`"),
         ("font_face", &[][..], "the family is \"Courier New\" (use font = \"Courier New\", weight = 700)"),
@@ -229,6 +364,9 @@ fn explicit_rules_reject() {
         ("font_both", &[][..], "give either `font` (a family) or `fontFile`"),
         ("pad", &[][..], "`pad = x` was `reach = x, grow = x`"),
         ("reach_negative", &[][..], "`r` is this effect's reach and can't be negative"),
+        ("transform_and_x", &[][..], "give either `transform` or `x`, not both"),
+        ("transform_short", &[][..], "expected 6 values { a, b, c, d, e, f }"),
+        ("measure_not_text", &[][..], "measure expects a Text { ... } element"),
     ] {
         let (_, out) = explicit(case, extra);
         let err = String::from_utf8_lossy(&out.stderr);

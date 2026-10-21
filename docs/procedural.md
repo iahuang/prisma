@@ -85,7 +85,9 @@ Mask { shape = Path { d = d }, stripes }
 
 `outline` takes a `Text` element and returns SVG path data in doc px,
 positioned exactly where that `Text` would render (`y` is the baseline). Use it for outlined,
-dashed or gradient-stroked type, or for type as a mask.
+dashed or gradient-stroked type, or for type as a mask. Concatenated with
+other path data and filled with `fillRule = "evenodd"`, it cuts lettering
+out of a shape ([scripting.md](scripting.md#holes-compound-shapes-and-outlines)).
 
 ## Distance fields: `Sdf`
 

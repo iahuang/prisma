@@ -24,11 +24,17 @@ debug build is much slower on the CPU side.
 | `--no-cache` | — | Don't read or write `.prisma-cache/` |
 | `-w, --watch` | — | Re-render when the script or any file it read changes |
 | `--profile` | — | Print GPU init, render size, offscreen pass count and timings to stderr |
-| `--root DIR` | script's directory | The only directory scripts may read from. Relative paths still resolve from the script, so `--root ..` lets a script reach `../photo.jpg`. |
+| `--root DIR` | script's directory | The only directory scripts may read from. Relative paths still resolve from the file they're written in, so `--root ..` lets a script reach `../photo.jpg`. |
 | `--timeout S` | `120` | Script wall-clock limit, including `rasterize` |
 
 A successful run prints `wrote out/x.png (WxH, Nms; script Nms)`. An error
 prints `error: file.luau:LINE: Element: message` and exits with status 1.
+
+A render that outgrew vello's GPU buffers prints `warning: the scene
+overflowed vello's GPU buffers: <buffer> (...) at WxH px, so it was rendered
+in pieces (N splits)`, plus a hint on what to cut back. The output is still
+correct. If pieces can't fit either, it's an error instead
+([pitfalls.md](pitfalls.md#big-renders)).
 
 ## The loop
 
@@ -81,4 +87,6 @@ are 360 px, labeled `k=v`. `--scale` and `--crop` apply to every cell.
 
 - The output (or crop) can't exceed the GPU's max texture size. The error
   says so. Render in pieces with `--crop`.
-- Input images are limited to 8192 px per side.
+- One image draws at most 8192 device px on a side, but any input size
+  works when `crop`ped or drawn smaller ([scripting.md](scripting.md#image)).
+  So a comparison script can zoom into a tall finished page.

@@ -18,7 +18,7 @@ use crate::render::render_document;
 use crate::text::Fonts;
 
 /// Bump when rendering changes in a way that invalidates cached rasters.
-const CACHE_VERSION: u32 = 4;
+const CACHE_VERSION: u32 = 6;
 
 /// Pixels materialized from a scene. Scripts read them (`r:at(x, y)`) and draw them (`Image { src = r }`).
 pub struct Raster {
@@ -141,9 +141,6 @@ impl Engine {
                 }
                 let decoded = image::open(&path).with_context(|| format!("decoding {}", path.display()))?.into_rgba8();
                 let (w, h) = decoded.dimensions();
-                if w > 8192 || h > 8192 {
-                    bail!("{} is {w}x{h}; images are limited to 8192px on a side for now", path.display());
-                }
                 let img = ImageData {
                     data: Blob::new(Arc::new(decoded.into_raw())),
                     format: ImageFormat::Rgba8,

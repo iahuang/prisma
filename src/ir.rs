@@ -58,6 +58,9 @@ pub enum Kind {
         fill: Option<Paint>,
         #[serde(skip_serializing_if = "Option::is_none")]
         stroke: Option<Stroke>,
+        /// Fill by the even-odd rule (overlaps and inner contours cut holes) instead of nonzero winding.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        even_odd: bool,
     },
     Text(Text),
     Image {

@@ -90,6 +90,7 @@ Shared style props:
 | Prop | Default | Notes |
 | --- | --- | --- |
 | `fill` | black | Paint. Stays black when you add a `stroke`: an outline-only shape says `fill = "none"`. `Line` is never filled, and a `fill` on it is an error. |
+| `fillRule` | `"nonzero"` | `nonzero evenodd`. With `evenodd`, wherever subpaths overlap an even number of times is a hole: see below. |
 | `stroke` | none | Paint |
 | `strokeWidth` | `1` | Length |
 | `cap` | `"butt"` | `butt round square` |
@@ -102,7 +103,7 @@ Shared style props:
 | `Circle` | `cx=0 cy=0 r` (r required) |
 | `Ellipse` | `cx=0 cy=0 rx ry` (required), `rotate=0` |
 | `Line` | `x1 y1 x2 y2` (all required). Never filled; stroke defaults to black. |
-| `Path` | `d` **or** `points` (not both), plus a transform `x=0 y=0 rotate=0 scale=1` |
+| `Path` | `d` **or** `points` (not both), plus a placement: `x=0 y=0 rotate=0 scale=1`, **or** `transform` (see `Group`) |
 
 `Path` details:
 
@@ -116,7 +117,29 @@ Shared style props:
   - `closed` and `smooth` only apply to `points`. Using them with `d` is an
     error.
 - `scale` is a number or `{ sx, sy }`. The transform is applied as
-  translate, then rotate, then scale.
+  translate, then rotate, then scale. `transform = { a, b, c, d, e, f }`
+  replaces all four, as on `Group`.
+
+#### Holes, compound shapes and outlines
+
+A logo or glyph-like mark is usually **one `Path`**, not shapes stacked
+under masks. Concatenate subpaths into one `d`, and cut holes with
+`fillRule = "evenodd"`: a point inside an even number of subpaths is
+outside the shape. (With the default `nonzero`, an inner contour is a hole
+only if it winds the other way.) Then draw the **same `d`** with
+`fill = "none"` and a `stroke` for an outline-only view, such as a
+construction diagram. `examples/logo.luau` does both:
+
+```lua
+local function circle(r) return `M{-r},0 A{r},{r} 0 1,0 {r},0 A{r},{r} 0 1,0 {-r},0 Z` end
+local mark = circle(120) .. circle(72) .. "M-150,-24 H150 V24 H-150 Z"  -- ring + bar
+Path { d = mark, x = 190, y = 180, fill = "#1d3557", fillRule = "evenodd" }  -- the mark
+Path { d = mark, x = 570, y = 180, fill = "none", stroke = "#e63946" }       -- its outlines
+```
+
+`outline(Text {...})` gives type as path data, so lettering can join a mark
+the same way. The path data is a plain string, so a script can build, reuse
+and transform it like any other value.
 
 ### `Group`
 
@@ -125,10 +148,25 @@ Shared style props:
 | `x`, `y` | `0` | Translation |
 | `rotate` | `0` | Degrees |
 | `scale` | `1` | Number or `{ sx, sy }`. `{ 0.6, 1 }` makes a condensed face out of a regular one. |
+| `transform` | none | `{ a, b, c, d, e, f }`: a general affine, **instead of** `x y rotate scale` (giving both is an error) |
 | `clip` | none | `{ x, y, w, h }` in the group's **local** coordinates |
 
 The transform order is translate · rotate · scale, so children rotate and
 scale about the group's own origin `(x, y)`.
+
+`transform` is in SVG `matrix(a, b, c, d, e, f)` order: a local point
+`(x, y)` lands at `(a x + c y + e, b x + d y + f)`. So `(a, b)` is where
+the local x axis points, `(c, d)` the local y axis, and `(e, f)` the
+origin (lengths). It expresses shear and any skewed "tilted screen" look,
+and everything inside stays vector: text, strokes and gradients are
+transformed, not resampled. It is affine only, so parallel lines stay
+parallel; there's no perspective.
+
+```lua
+Group { transform = { 1, 0, 0.5, 1, 600, 300 }, Rect { w = 40, h = 40 } }  -- sheared right
+-- map the local axes onto two measured screen directions
+Group { transform = { ux * s, uy * s, vx * s, vy * s, ox, oy }, ui }
+```
 
 ### `Mask`
 
@@ -143,6 +181,10 @@ Mask { shape = Circle { cx = 340, cy = 400, r = 60, blur = 12 },  -- the gate
 | `shape` | **required** | An element or a list. Its alpha gates the children. A blurred shape gives a soft mask. |
 | `invert` | `false` | Keep the content *outside* the shape |
 | `luminance` | `false` | Gate by the shape's brightness × alpha instead of alpha alone. Costs an offscreen pass. |
+
+To cut a hard-edged hole in a shape, prefer one `Path` with
+`fillRule = "evenodd"` ([above](#holes-compound-shapes-and-outlines)) to a
+`Mask`: it's cheaper, and it stays a path you can stroke.
 
 ### `Text`
 
@@ -200,7 +242,12 @@ Image { src = someRaster, x = 20, y = 20 }  -- a value returned by rasterize()
 | `crop` | whole image | `{ x, y, w, h }` source rect, in **image px** for files and **doc px** for rasters |
 | `fit` | `"fill"` | `fill` stretches; `cover` fills `w×h` and crops the overflow; `contain` letterboxes |
 
-The formats are PNG, JPEG and WebP. Images are limited to 8192 px per side.
+The formats are PNG, JPEG and WebP, at any size that decodes (512 MiB
+of pixels). vello draws an image at most 8192 px on a side, so for a bigger
+one prisma uploads only the part `crop`/`fit` shows, downsampled to the size
+it's drawn at. Drawing more than 8192 device px of one image in one
+direction (say, a 12000 px tall page at full size into a 12000 px canvas)
+is an error that says so; crop it into pieces.
 
 ### Effects and `Sdf`
 
@@ -218,14 +265,43 @@ These are elements too: `Halftone { cell = 9, ... children }`,
 | `pick(list)` | A seeded random element |
 | `linear`, `radial` | Gradients (above) |
 | `grid`, `hexGrid`, `sample`, `rasterize` | [procedural.md](procedural.md) |
-| `outline(Text {...})` | Glyph outlines as SVG path data ([procedural.md](procedural.md#type-as-geometry-outline)) |
+| `outline(Text {...})` | Glyph outlines as SVG path data for a `Path`: stroke it with `fill = "none"`, mask with it, or join it to a mark ([procedural.md](procedural.md#type-as-geometry-outline)) |
+| `measure(Text {...})` | Where the text's lines and ink land (below) |
 | `effect { ... }` | Define a shader effect ([effects.md](effects.md)) |
 | `Halftone Duotone Posterize Grain Displace Speckle Rough` | Built-in effects |
-| `require("lib/x")` | Loads `lib/x.luau` relative to the entry script, once per run, and returns its value |
+| `require("lib/x")` | Loads `lib/x.luau` relative to the file calling `require`, once per run, and returns its value |
+
+### `measure`
+
+`measure(Text { ... })` lays the text out exactly as drawing it would (same
+`x`, `y`, `w`, `anchor`, `align`, font props) and returns doc px in the
+text's own coordinates:
+
+| Field | |
+| --- | --- |
+| `x`, `y`, `w`, `h` | Advance box: from the leftmost line start to the rightmost line end, and from the top of the first line box to the bottom of the last. With `anchor = "end"`, `x + w` is the text's `x`. |
+| `baseline` | The first line's baseline (the text's `y`) |
+| `ascent`, `descent` | The first line's font ascent and descent, both positive |
+| `lines` | `{ { x, w, baseline }, ... }`, one per laid-out line |
+| `ink` | `{ x, y, w, h }`: tight bounds of the glyph outlines. `nil` when nothing is inked (only spaces). |
+
+The text's own trailing spaces count toward `w` (as `anchor` places them);
+the space a wrapped line breaks at doesn't. The element passed in is not
+drawn, so you can measure first and then edit and return the same table:
+
+```lua
+local t = Text { x = 24, y = 40, size = 15, "Product" }
+local m = measure(t)
+Rect { x = m.x - 8, y = m.y, w = m.w + 16, h = m.h, r = 6, fill = "#222" }  -- pill that fits
+Text { x = m.x + m.w + 12, y = 40, size = 15, "Insights" }                 -- chain the next piece
+```
 
 **Sandbox**: only Luau's safe standard libraries are available. There's no
 `io` or `os`, and no `loadstring`, `getfenv` or `setfenv`. Globals are
-read-only. Relative paths (images, fonts, `require`) resolve from the entry
-script's directory and must stay under the project root (`--root`, which
-defaults to the script's directory). A run is limited to 2 GiB of memory and
+read-only. Relative paths (`require`, `Image` `src`, `fontFile`) resolve
+from the directory of the file they're written in, so a shared helper in
+`lib/` finds its own files whichever script requires it. A path a helper
+receives as an argument resolves from the helper, so pass it already
+joined. Every path must stay under the project root (`--root`, which
+defaults to the entry script's directory). A run is limited to 2 GiB of memory and
 `--timeout` seconds (default 120, including `rasterize` calls).

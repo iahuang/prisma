@@ -18,3 +18,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 skrifa = { version = "0.44", default-features = false, features = ["std"] }
 vello = "0.11"
+
+# vello patched to report GPU buffer overflow instead of rendering a silent
+# blank: see vendor/vello/PRISMA.md.
+[patch.crates-io]
+vello = { path = "vendor/vello" }

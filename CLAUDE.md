@@ -1,4 +1,3 @@
-- `cargo test --release` renders every example on the GPU; add an example + pixel check for new features.
 - When a render looks wrong, use `--dump DIR` (writes every offscreen pass's input and output) and `--crop` before guessing.
 - Scratch renders go in `out/` (gitignored).
 - Docs for agents live in `docs/` (start at `docs/README.md`): script API, effects, CLI/debugging, pitfalls, architecture. Update them when behavior changes.

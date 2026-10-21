@@ -10,7 +10,7 @@ use parley::{Alignment, AlignmentOptions, FontContext, Layout, LayoutContext, Po
 use skrifa::MetadataProvider;
 use skrifa::instance::{LocationRef, Size};
 use skrifa::outline::{DrawSettings, OutlinePen};
-use vello::kurbo::{Affine, BezPath, Rect};
+use vello::kurbo::{Affine, BezPath, Rect, Shape};
 use vello::peniko::Blob;
 
 use crate::ir::{Align, Anchor, Font, Text};
@@ -155,6 +155,32 @@ impl Fonts {
         Rect::new(x, y, x + w, y + layout.height() as f64).inflate(t.size * 0.5, t.size * 0.5)
     }
 
+    /// Where a text node's lines and glyphs land, in doc px (`measure` in scripts).
+    pub fn measure(&mut self, t: &Text) -> Result<Metrics> {
+        let layout = self.layout(t)?;
+        let (ox, oy) = Fonts::origin(t, &layout);
+        let mut lines = Vec::new();
+        for line in layout.lines() {
+            let m = line.metrics();
+            // The space a line wraps at hangs and isn't counted; the text's own trailing
+            // spaces are, just as `anchor` places them.
+            let w = (m.advance - m.hanging_advance) as f64;
+            lines.push(LineMetrics { x: ox + m.offset as f64, w, baseline: oy + m.baseline as f64 });
+        }
+        let (x0, x1) = lines.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), l| (a.min(l.x), b.max(l.x + l.w)));
+        let (x0, x1) = if lines.is_empty() { (ox, ox) } else { (x0, x1) };
+        let first = layout.lines().next().map(|l| *l.metrics());
+        let ink = self.outline(t)?;
+        Ok(Metrics {
+            advance: Rect::new(x0, oy, x1, oy + layout.height() as f64),
+            baseline: t.y,
+            ascent: first.map_or(0.0, |m| (m.baseline - m.content_block_min_coord) as f64),
+            descent: first.map_or(0.0, |m| (m.content_block_max_coord - m.baseline) as f64),
+            ink: (!ink.elements().is_empty()).then(|| ink.bounding_box()),
+            lines,
+        })
+    }
+
     /// Glyph outlines of a laid-out text node as one path, in doc px.
     pub fn outline(&mut self, t: &Text) -> Result<BezPath> {
         let layout = self.layout(t)?;
@@ -182,6 +208,26 @@ impl Fonts {
         }
         Ok(out)
     }
+}
+
+pub struct Metrics {
+    /// The lines' advance box: from the leftmost line start to the rightmost line
+    /// end, and from the top of the first line box to the bottom of the last.
+    pub advance: Rect,
+    /// The first line's baseline (the text's `y`).
+    pub baseline: f64,
+    /// The first line's font ascent and descent, both positive.
+    pub ascent: f64,
+    pub descent: f64,
+    pub lines: Vec<LineMetrics>,
+    /// Tight bounds of the glyph outlines; None when nothing is inked (e.g. only spaces).
+    pub ink: Option<Rect>,
+}
+
+pub struct LineMetrics {
+    pub x: f64,
+    pub w: f64,
+    pub baseline: f64,
 }
 
 fn tag_of(s: &str) -> parlance::Tag {

@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow};
+use vello::low_level::vello_encoding::BumpAllocators;
 use vello::wgpu::{self, util::DeviceExt};
 use vello::{AaConfig, AaSupport, RenderParams, RendererOptions, Scene, peniko};
 
@@ -25,7 +26,97 @@ impl IRect {
     pub fn expand(self, by: u32) -> IRect {
         IRect { x: self.x - by as i32, y: self.y - by as i32, w: self.w + 2 * by, h: self.h + 2 * by }
     }
+
+    /// Covers this with rects at most `size` on a side.
+    pub fn tiles(self, size: u32) -> Vec<IRect> {
+        let mut out = Vec::new();
+        for y in (0..self.h).step_by(size as usize) {
+            for x in (0..self.w).step_by(size as usize) {
+                out.push(IRect { x: self.x + x as i32, y: self.y + y as i32, w: size.min(self.w - x), h: size.min(self.h - y) });
+            }
+        }
+        out
+    }
+
+    /// Halves across the longer side, the first half on a 16px (vello tile) boundary.
+    pub fn split(self) -> [IRect; 2] {
+        if self.w >= self.h {
+            let a = (self.w / 2).next_multiple_of(16).min(self.w - 1);
+            [IRect { w: a, ..self }, IRect { x: self.x + a as i32, w: self.w - a, ..self }]
+        } else {
+            let a = (self.h / 2).next_multiple_of(16).min(self.h - 1);
+            [IRect { h: a, ..self }, IRect { y: self.y + a as i32, h: self.h - a, ..self }]
+        }
+    }
 }
+
+/// A vello render that outgrew one of vello's fixed-size GPU buffers. vello
+/// skips drawing when that happens, so the output would be blank or partial.
+#[derive(Debug)]
+pub struct Overflow(BumpAllocators);
+
+/// A vello render's buffer counters, readable once the GPU has finished it
+/// (see [`Gpu::check`]). Reading them at once would stall the GPU every render.
+pub struct BumpCheck(wgpu::Buffer);
+
+// vello_shaders' shared/bump.wgsl stage flags, and the buffer sizes
+// vello_encoding's BufferSizes hard-codes (in elements).
+const STAGE_BINNING: u32 = 0x1;
+const STAGE_TILE_ALLOC: u32 = 0x2;
+const STAGE_FLATTEN: u32 = 0x4;
+const STAGE_PATH_COUNT: u32 = 0x8;
+const STAGE_COARSE: u32 = 0x10;
+const BLEND_SPILL_SIZE: u32 = 1 << 20;
+
+impl Overflow {
+    /// Whether rendering a smaller region can fit. Everything but the line
+    /// buffer scales with the area rendered; vello flattens every path in the
+    /// scene, however little of it is in view.
+    pub fn splittable(&self) -> bool {
+        self.0.failed & STAGE_FLATTEN == 0
+    }
+
+    /// What in a design to cut back so it fits.
+    pub fn hint(&self) -> &'static str {
+        let b = &self.0;
+        if b.failed & STAGE_FLATTEN != 0 {
+            "Use fewer or simpler paths (points, glyphs, copies of a detailed shape)."
+        } else if b.failed & STAGE_COARSE != 0 && b.blend > BLEND_SPILL_SIZE {
+            "Nest fewer masks, faded (opacity) or blended layers past 4 deep, or keep the deep ones small."
+        } else {
+            "vello's cost grows with the area each shape, layer and clip covers: fewer large ones fit in one piece."
+        }
+    }
+}
+
+impl std::fmt::Display for Overflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let b = &self.0;
+        let mut what = Vec::new();
+        if b.failed & STAGE_FLATTEN != 0 {
+            what.push(format!("line segments ({} after flattening, limit {})", b.lines, 1 << 21));
+        }
+        if b.failed & STAGE_BINNING != 0 {
+            what.push(format!("bin data ({}, limit {})", b.binning, 1 << 18));
+        }
+        if b.failed & STAGE_TILE_ALLOC != 0 {
+            what.push(format!("path tiles ({}, limit {})", b.tile, 1 << 21));
+        }
+        if b.failed & STAGE_PATH_COUNT != 0 {
+            what.push(format!("segment tiles ({}, limit {})", b.seg_counts, 1 << 21));
+        }
+        if b.failed & STAGE_COARSE != 0 {
+            if b.blend > BLEND_SPILL_SIZE {
+                what.push(format!("blend spill: layers nested more than 4 deep ({} words, limit {BLEND_SPILL_SIZE})", b.blend));
+            } else {
+                what.push(format!("tile commands ({} words over the base allocation, limit {})", b.ptcl, 1 << 23));
+            }
+        }
+        write!(f, "the scene overflowed vello's GPU buffers: {}", what.join(", "))
+    }
+}
+
+impl std::error::Error for Overflow {}
 
 pub struct Gpu {
     pub device: wgpu::Device,
@@ -542,8 +633,9 @@ impl Gpu {
         })
     }
 
-    /// Renders a vello scene to a new straight-alpha texture.
-    pub fn render_scene(&mut self, scene: &Scene, w: u32, h: u32) -> Result<wgpu::Texture> {
+    /// Renders a vello scene to a new straight-alpha texture. Whether it fit
+    /// vello's buffers is known only once `check` reads the returned counters.
+    pub fn render_scene(&mut self, scene: &Scene, w: u32, h: u32) -> Result<(wgpu::Texture, BumpCheck)> {
         let tex = self.texture(
             w,
             h,
@@ -551,21 +643,70 @@ impl Gpu {
             wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
         );
         let view = tex.create_view(&Default::default());
-        self.vello
-            .render_to_texture(
-                &self.device,
-                &self.queue,
-                scene,
-                &view,
-                &RenderParams {
-                    base_color: peniko::Color::TRANSPARENT,
-                    width: w.max(1),
-                    height: h.max(1),
-                    antialiasing_method: AaConfig::Area,
-                },
-            )
+        let params = RenderParams {
+            base_color: peniko::Color::TRANSPARENT,
+            width: w.max(1),
+            height: h.max(1),
+            antialiasing_method: AaConfig::Area,
+        };
+        let bump = self
+            .vello
+            .render_to_texture_with_bump(&self.device, &self.queue, scene, &view, &params)
             .map_err(|e| anyhow!("vello render: {e}"))?;
-        Ok(tex)
+        Ok((tex, BumpCheck(bump)))
+    }
+
+    /// Waits for the GPU, then fails with an [`Overflow`] if any of these renders overflowed.
+    pub fn check(&self, checks: &[BumpCheck]) -> Result<()> {
+        for c in checks {
+            c.0.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        }
+        self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| anyhow!("gpu poll: {e}"))?;
+        let mut overflow = None;
+        for c in checks {
+            let data = c.0.slice(..).get_mapped_range().map_err(|e| anyhow!("gpu readback: {e}"))?;
+            let bump: BumpAllocators = bytemuck::pod_read_unaligned(&data[..size_of::<BumpAllocators>()]);
+            if bump.failed != 0 && overflow.is_none() {
+                overflow = Some(Overflow(bump));
+            }
+        }
+        overflow.map_or(Ok(()), |o| Err(o.into()))
+    }
+
+    /// A copy of the `w`x`h` part of `tex` at `x`, `y` (in its own pixels).
+    pub fn crop(&self, tex: &wgpu::Texture, x: i32, y: i32, w: u32, h: u32) -> wgpu::Texture {
+        let out = self.texture(
+            w,
+            h,
+            tex.format(),
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+        );
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let origin = wgpu::Origin3d { x: x as u32, y: y as u32, z: 0 };
+        enc.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo { origin, ..tex.as_image_copy() },
+            out.as_image_copy(),
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([enc.finish()]);
+        out
+    }
+
+    /// Copies textures covering `pieces` (in absolute device px) into one covering `r`.
+    pub fn stitch(&self, r: IRect, pieces: &[(IRect, wgpu::Texture)]) -> wgpu::Texture {
+        let out = self.texture(
+            r.w,
+            r.h,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+        );
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        for (p, tex) in pieces {
+            let origin = wgpu::Origin3d { x: (p.x - r.x) as u32, y: (p.y - r.y) as u32, z: 0 };
+            enc.copy_texture_to_texture(tex.as_image_copy(), wgpu::TexelCopyTextureInfo { origin, ..out.as_image_copy() }, tex.size());
+        }
+        self.queue.submit([enc.finish()]);
+        out
     }
 
     fn pass_target(&self, w: u32, h: u32, format: wgpu::TextureFormat) -> wgpu::Texture {

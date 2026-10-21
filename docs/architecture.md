@@ -12,15 +12,16 @@
 | File | Owns |
 | --- | --- |
 | `src/main.rs` | CLI (clap), watch loop, `--sweep` contact sheets, `--crop`/`--scale` → device rect |
-| `src/script.rs` | Luau sandbox; installs globals (`PRIMITIVES` constructors, `params`, `param`, `effect`, `rasterize`, `outline`, `require`); `Props` (prop reading + unknown-prop errors with edit-distance hints); `Conv` (tables → IR) |
+| `src/script.rs` | Luau sandbox; installs globals (`PRIMITIVES` constructors, `params`, `param`, `effect`, `rasterize`, `outline`, `measure`, `require`); `Props` (prop reading + unknown-prop errors with edit-distance hints); `Conv` (tables → IR) |
 | `src/prelude.luau` | Lua-side helpers (`random`, `pick`, `linear`, `radial`, `grid`, `hexGrid`, `sample`) and the built-in effects, written as user code |
 | `src/ir.rs` | `Document`, `Node { kind, opacity, blend, blur, at }`, `Kind`, `Geom`, `Paint`, ... Everything in doc px and straight RGBA. |
 | `src/units.rs` | `parse_length` (px pt mm cm in), `parse_color` |
-| `src/render.rs` | IR → pixels: encodes nodes into vello scenes in absolute device coords; decides which nodes need offscreen passes; computes bounds; `--dump` |
-| `src/gpu.rs` | wgpu device, vello renderer, the fixed pipelines (separable blur, down/up sampling, mask, jump-flood SDF), effect pipeline cache, readback |
+| `src/render.rs` | IR → pixels: encodes nodes into vello scenes in absolute device coords; decides which nodes need offscreen passes; computes bounds; overflow retry and splitting; atlas-sized images and tiles; `--dump` |
+| `src/gpu.rs` | wgpu device, vello renderer, the fixed pipelines (separable blur, down/up sampling, mask, jump-flood SDF), effect pipeline cache, readback, overflow checks (`Overflow`, `BumpCheck`, `Gpu::check`) |
+| `vendor/vello/` | vello 0.11 with one addition, `render_to_texture_with_bump`, so overflow can be detected (`vendor/vello/PRISMA.md`) |
 | `src/effects.rs` | `EffectDef`: uniform types, packing (colors first, then f32s), `reach`/`grow`, the WGSL prelude (`src`, `pm`, `hash`, `fbm`, ...), naga validation |
 | `src/text.rs` | Font resolution (an exact system family or a font file; face words only feed the not-found hint), parley layout, skrifa glyph outlines |
-| `src/engine.rs` | State that outlives a run: GPU, fonts, decoded images, rasters, the effect registry (cleared at the start of each run); path resolution (`resolve`: relative to `script_dir`, confined to `base_dir` = `--root`); `rasterize` memoization (memory + `.prisma-cache/`) |
+| `src/engine.rs` | State that outlives a run: GPU, fonts, decoded images, rasters, the effect registry (cleared at the start of each run); path resolution (`resolve`: relative to `script_dir`, confined to `base_dir` = `--root`; `script.rs` first rewrites a path as written in a module to one from `script_dir`, via the chunk name); `rasterize` memoization (memory + `.prisma-cache/`) |
 | `tests/examples.rs` | Renders every example through the binary and checks pixels |
 
 ## Key invariants
@@ -61,7 +62,25 @@
   inverted masks stay inside vello as `DestIn`/`DestOut` layers. Opacity and
   blend on containers are vello layers clipped to tight bounds.
 - **Bounds** (`Pass::bounds`) must be conservative for every `Kind`. A new
-  kind that reports bounds too small gets clipped silently.
+  kind that reports bounds too small gets clipped silently. Mask layers are
+  clipped to them too.
+- **vello's buffers are fixed-size**, and an overflowing scene renders blank
+  with no error from vello. Every vello render goes through
+  `Gpu::render_scene`, which also downloads vello's counters without waiting.
+  `Pass::document` checks them all once at the end (`Gpu::check`). On an
+  overflow, `render_document` runs the whole pass again with `checked`, which
+  checks each render as it's made and splits an overflowing region in halves
+  (`Pass::render_region`, down to `MIN_SPLIT`), with a warning. Checking
+  every render up front would stall the GPU each time. Line-segment overflow
+  can't be split (vello flattens the whole scene for any viewport), so it's
+  an error. Keep layers tight: a layer costs a blend level in every 16 px
+  tile it covers, and past 4 nested levels each tile spills to a buffer with
+  room for 4096.
+- **vello's image atlas is at most 8192 px** (`ATLAS_MAX`), and vello skips an
+  image that doesn't fit without a word. Draw pass textures with
+  `Pass::draw_texture` (it tiles big ones). File images over the limit go
+  through `atlas_fit`, which uploads only the drawn source rect, resampled
+  to device resolution.
 - **IR is the cache key.** `Engine::rasterize` hashes `CACHE_VERSION`, the
   dpi, the IR JSON and external stamps (image/font mtimes, effect module
   source). **Bump `CACHE_VERSION` in `engine.rs` whenever rendering output
@@ -107,8 +126,14 @@ cargo test --release
   checks that every example renders (`all_examples_render`), samples exact
   pixels (`basics_pixels`, `sdf_pixels` at scales 1 and 2), measures `"sdf"`
   input precision against an exact polygon (`sdf_input_is_exact`), checks that
-  input slots reject anything but an `Sdf` (`sdf_inputs_are_explicit`), and checks crop
-  invariance (`crop_matches_full_render`, tolerance 2/255).
+  input slots reject anything but an `Sdf` (`sdf_inputs_are_explicit`), checks a
+  sheared `transform` (`transform_pixels`) and `measure` against layout
+  (`measure_matches_layout`, `tests/fixtures/measure.luau`), and checks crop
+  invariance (`crop_matches_full_render`, tolerance 2/255). Even-odd fills
+  and outlines are checked in `logo_pixels`. vello buffer overflow (bounded mask layers, a
+  split render matching a crop, the line-segment error) is checked against
+  `tests/fixtures/overflow.luau`, and images and passes over the atlas limit
+  against `tests/fixtures/big.luau`.
 - **For a new feature, add an example to `examples/` and add it to the list
   in `all_examples_render`.** Then add a pixel test that checks the feature's
   actual math at known coordinates, and a crop check if the feature is

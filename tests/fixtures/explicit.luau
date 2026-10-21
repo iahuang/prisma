@@ -20,6 +20,8 @@ local cases = {
 	opacity_range = function() return Circle { cx = 50, cy = 50, r = 30, opacity = 1.5 } end,
 	blur_negative = function() return Circle { cx = 50, cy = 50, r = 30, blur = -2 } end,
 	line_fill = function() return Line { x1 = 0, y1 = 0, x2 = 10, y2 = 10, fill = "#f00" } end,
+	line_fill_rule = function() return Line { x1 = 0, y1 = 0, x2 = 10, y2 = 10, fillRule = "evenodd" } end,
+	fill_rule = function() return Rect { w = 10, h = 10, fillRule = "winding" } end,
 	align_unboxed = function() return Text { x = 10, y = 50, align = "right", "x" } end,
 	anchor_boxed = function() return Text { x = 10, y = 50, w = 80, anchor = "end", "x" } end,
 	font_face = function() return Text { x = 10, y = 50, font = "Courier New Bold", "x" } end,
@@ -33,5 +35,9 @@ local cases = {
 		local Fx = effect { uniforms = { r = { "length", 4 } }, reach = "r", wgsl = "fn effect(p: vec2f) -> vec4f { return src(p); }" }
 		return Fx { r = -3, shape }
 	end,
+	-- transform is the whole placement; it doesn't combine with x/y/rotate/scale
+	transform_and_x = function() return Group { transform = { 1, 0, 0, 1, 0, 0 }, x = 5, shape } end,
+	transform_short = function() return Path { d = "M0,0 L10,10", transform = { 1, 0, 0, 1 } } end,
+	measure_not_text = function() return measure(shape) end,
 }
 return Canvas { size = { 200, 100 }, bg = "#fff", cases[param("case")]() }

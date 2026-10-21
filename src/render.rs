@@ -20,7 +20,7 @@ use vello::peniko::{self, Blob, BlendMode, Brush, Compose, Fill, Gradient, Image
 use vello::{Scene, wgpu};
 
 use crate::engine::Engine;
-use crate::gpu::{IRect, MaskMode};
+use crate::gpu::{BumpCheck, IRect, MaskMode, Overflow};
 use crate::ir::{Blend, Cap, Document, Fit, Geom, Join, Kind, Node, Paint, Stroke};
 use crate::text::Fonts;
 use crate::units::to_color;
@@ -41,7 +41,23 @@ pub struct Pass<'a> {
     dumped: usize,
     /// Per scene being built (innermost last): source blob id -> image with this scene's id.
     scene_images: Vec<HashMap<u64, ImageData>>,
+    /// Check each vello render as it's made, splitting one that overflows. Off
+    /// for the first try: waiting on every render would stall the GPU.
+    checked: bool,
+    /// Without `checked`, the renders to check once the GPU is done.
+    unchecked: Vec<BumpCheck>,
+    /// The first overflow that split a render (and its hint), and how many splits it took.
+    overflow: Option<(String, &'static str)>,
+    splits: usize,
 }
+
+/// Regions this small aren't split further: if one overflows, smaller won't fit either.
+const MIN_SPLIT: u32 = 128;
+
+/// The largest image vello draws, on a side: its image atlas (vello_encoding's
+/// MAX_ATLAS_SIZE) holds every image a scene draws, and it silently skips one
+/// that doesn't fit.
+const ATLAS_MAX: u32 = 8192;
 
 /// Renders a document at `scale` device px per doc px. `region` is in device px
 /// (None = the whole canvas); noise and grain are positioned absolutely, so a
@@ -59,28 +75,22 @@ pub fn render_document(eng: &mut Engine, doc: &Document, scale: f64, region: Opt
     if region.w > max || region.h > max {
         bail!("output {}x{} exceeds the GPU's {max}px texture limit (use --crop to render it in pieces)", region.w, region.h);
     }
-    let mut pass = Pass {
-        eng,
-        fine: false,
-        scale,
-        resolution: [canvas.w as f32, canvas.h as f32],
-        overrides: Vec::new(),
-        offscreen_passes: 0,
-        dumped: 0,
-        scene_images: Vec::new(),
+    let attempt = |eng: &mut Engine, checked: bool| {
+        let mut pass = Pass::new(eng, scale, canvas, checked);
+        let result = pass.document(doc, canvas, region);
+        pass.finish();
+        (result, pass.offscreen_passes, pass.overflow, pass.splits)
     };
-    let xf = Affine::scale(scale);
-    let roi = irect(region);
-    let result = pass
-        .scene(|p, scene| {
-            if doc.bg[3] > 0.0 {
-                scene.fill(Fill::NonZero, Affine::IDENTITY, to_color(doc.bg), None, &irect(canvas));
-            }
-            doc.children.iter().try_for_each(|n| p.encode(scene, n, xf, roi))
-        })
-        .and_then(|scene| pass.render_region(&scene, region));
-    let passes = pass.offscreen_passes;
-    pass.finish();
+    let mut out = attempt(eng, false);
+    if out.0.as_ref().is_err_and(|e| e.is::<Overflow>()) {
+        // Some render outgrew vello's buffers. Rare, so only now pay for
+        // checking each one, to find it and render it in pieces.
+        out = attempt(eng, true);
+    }
+    let (result, passes, overflow, splits) = out;
+    if let Some((overflow, hint)) = overflow {
+        eprintln!("warning: {overflow}, so it was rendered in pieces ({splits} splits), which is slower. {hint}");
+    }
     if eng.profile {
         eprintln!("render {}x{} @{scale}: {passes} offscreen passes, {:.1}ms", region.w, region.h, t0.elapsed().as_secs_f64() * 1e3);
     }
@@ -115,6 +125,14 @@ fn scale_of(xf: Affine) -> f64 {
     xf.determinant().abs().sqrt()
 }
 
+/// The most a transform stretches any length (its largest singular value).
+fn max_scale_of(xf: Affine) -> f64 {
+    let [a, b, c, d, _, _] = xf.as_coeffs();
+    let s = a * a + b * b + c * c + d * d;
+    let det = a * d - b * c;
+    ((s + (s * s - 4.0 * det * det).max(0.0).sqrt()) / 2.0).sqrt()
+}
+
 fn mix(b: Blend) -> BlendMode {
     let m = match b {
         Blend::Normal => Mix::Normal,
@@ -147,6 +165,55 @@ pub fn geom_path(g: &Geom) -> Result<BezPath> {
         Geom::Line { x1, y1, x2, y2 } => kurbo::Line::new((x1, y1), (x2, y2)).to_path(TOL),
         Geom::Path { ref d, transform } => Affine::new(transform) * BezPath::from_svg(d).map_err(|e| anyhow!("bad path data: {e}"))?,
     })
+}
+
+/// For an image bigger than vello's atlas: the part of it that the source rect
+/// `src` draws (plus a pixel of margin, so filtering at the edges matches),
+/// resampled to no more than `px_per_src` device px per source px. Returns it
+/// premultiplied, with the transform from its pixels to the image's.
+fn atlas_fit(img: &ImageData, src: [f64; 4], px_per_src: f64) -> Result<(ImageData, Affine)> {
+    let [sx, sy, sw, sh] = src;
+    let x0 = (sx.floor() - 1.0).max(0.0) as u32;
+    let y0 = (sy.floor() - 1.0).max(0.0) as u32;
+    let x1 = ((sx + sw).ceil() + 1.0).min(img.width as f64) as u32;
+    let y1 = ((sy + sh).ceil() + 1.0).min(img.height as f64) as u32;
+    let (w, h) = (x1.saturating_sub(x0).max(1), y1.saturating_sub(y0).max(1));
+    let k = px_per_src.min(1.0);
+    let (nw, nh) = (((w as f64 * k).ceil() as u32).max(1), ((h as f64 * k).ceil() as u32).max(1));
+    if nw > ATLAS_MAX || nh > ATLAS_MAX {
+        bail!(
+            "this draws {w}x{h} px of a {}x{} image at {nw}x{nh} device px, over the {ATLAS_MAX}px vello can draw one image at: \
+             crop it (`crop`) or draw it smaller",
+            img.width,
+            img.height
+        );
+    }
+    let (data, stride) = (img.data.data(), img.width as usize * 4);
+    let mut rows = Vec::with_capacity(w as usize * h as usize * 4);
+    for y in y0..y0 + h {
+        rows.extend_from_slice(&data[y as usize * stride + x0 as usize * 4..][..w as usize * 4]);
+    }
+    let mut part = image::RgbaImage::from_raw(w, h, rows).expect("rows are w x h");
+    if img.alpha_type == ImageAlphaType::Alpha {
+        for p in part.pixels_mut() {
+            let a = p.0[3] as u32;
+            for c in 0..3 {
+                p.0[c] = ((p.0[c] as u32 * a + 127) / 255) as u8;
+            }
+        }
+    }
+    if (nw, nh) != (w, h) {
+        part = image::imageops::resize(&part, nw, nh, image::imageops::FilterType::Triangle);
+    }
+    let out = ImageData {
+        data: Blob::new(std::sync::Arc::new(part.into_raw())),
+        format: ImageFormat::Rgba8,
+        alpha_type: ImageAlphaType::AlphaPremultiplied,
+        width: nw,
+        height: nh,
+    };
+    let at = Affine::translate((x0 as f64, y0 as f64)) * Affine::scale_non_uniform(w as f64 / nw as f64, h as f64 / nh as f64);
+    Ok((out, at))
 }
 
 /// `path` as straight segments within `tolerance` (in its own units).
@@ -185,11 +252,42 @@ fn kurbo_stroke(s: &Stroke) -> kurbo::Stroke {
     if s.dash.is_empty() { st } else { st.with_dashes(0.0, s.dash.iter().copied()) }
 }
 
-impl Pass<'_> {
+impl<'a> Pass<'a> {
+    fn new(eng: &'a mut Engine, scale: f64, canvas: IRect, checked: bool) -> Pass<'a> {
+        Pass {
+            eng,
+            fine: false,
+            scale,
+            resolution: [canvas.w as f32, canvas.h as f32],
+            overrides: Vec::new(),
+            offscreen_passes: 0,
+            dumped: 0,
+            scene_images: Vec::new(),
+            checked,
+            unchecked: Vec::new(),
+            overflow: None,
+            splits: 0,
+        }
+    }
+
+    fn document(&mut self, doc: &Document, canvas: IRect, region: IRect) -> Result<wgpu::Texture> {
+        let xf = Affine::scale(self.scale);
+        let roi = irect(region);
+        let scene = self.scene(|p, scene| {
+            if doc.bg[3] > 0.0 {
+                scene.fill(Fill::NonZero, Affine::IDENTITY, to_color(doc.bg), None, &irect(canvas));
+            }
+            doc.children.iter().try_for_each(|n| p.encode(scene, n, xf, roi))
+        })?;
+        let tex = self.render_region(&scene, region)?;
+        self.eng.gpu.check(&std::mem::take(&mut self.unchecked))?;
+        Ok(tex)
+    }
+
     /// Unregisters the offscreen textures handed to vello during this pass.
-    fn finish(self) {
-        for img in &self.overrides {
-            self.eng.gpu.vello.override_image(img, None);
+    fn finish(&mut self) {
+        for img in self.overrides.drain(..) {
+            self.eng.gpu.vello.override_image(&img, None);
         }
     }
 
@@ -234,10 +332,36 @@ impl Pass<'_> {
             .clone()
     }
 
+    /// Renders `r` of `scene`. With `checked`, a region that overflows vello's
+    /// buffers is rendered in halves and stitched (same pixels, just slower).
     fn render_region(&mut self, scene: &Scene, r: IRect) -> Result<wgpu::Texture> {
         let mut local = Scene::new();
         local.append(scene, Some(Affine::translate((-r.x as f64, -r.y as f64))));
-        self.eng.gpu.render_scene(&local, r.w, r.h)
+        let (tex, bump) = self.eng.gpu.render_scene(&local, r.w, r.h)?;
+        if !self.checked {
+            self.unchecked.push(bump);
+            return Ok(tex);
+        }
+        let err = match self.eng.gpu.check(&[bump]) {
+            Ok(()) => return Ok(tex),
+            Err(e) => e,
+        };
+        let Some(overflow) = err.downcast_ref::<Overflow>() else { return Err(err) };
+        if !overflow.splittable() {
+            bail!("{overflow}. Rendering in pieces can't help: vello flattens every path in the scene, in view or not. {}", overflow.hint());
+        }
+        if r.w.max(r.h) <= MIN_SPLIT {
+            bail!("{overflow}, even rendering {}x{} px at a time. {}", r.w, r.h, overflow.hint());
+        }
+        if self.overflow.is_none() {
+            self.overflow = Some((format!("{overflow} at {}x{} px", r.w, r.h), overflow.hint()));
+        }
+        self.splits += 1;
+        let mut pieces = Vec::new();
+        for p in r.split() {
+            pieces.push((p, self.render_region(scene, p)?));
+        }
+        Ok(self.eng.gpu.stitch(r, &pieces))
     }
 
     /// Makes a premultiplied texture drawable in a scene.
@@ -270,17 +394,29 @@ impl Pass<'_> {
             return Ok(());
         };
         let tex = if n.blur > 0.0 { self.blurred(n, xf, b)? } else { self.pass(n, xf, b)? };
-        let img = self.register(tex);
-        let brush = ImageBrush::new(img).with_alpha(n.opacity);
-        let at = Affine::translate((b.x as f64, b.y as f64));
         if n.blend.is_normal() {
-            scene.draw_image(&brush, at);
+            self.draw_texture(scene, tex, b, n.opacity);
         } else {
             scene.push_layer(Fill::NonZero, mix(n.blend), 1.0, Affine::IDENTITY, &irect(b));
-            scene.draw_image(&brush, at);
+            self.draw_texture(scene, tex, b, n.opacity);
             scene.pop_layer();
         }
         Ok(())
+    }
+
+    /// Draws a premultiplied texture covering `b`. vello's image atlas skips an
+    /// image wider or taller than ATLAS_MAX without a word, so a bigger texture
+    /// goes in as tiles.
+    fn draw_texture(&mut self, scene: &mut Scene, tex: wgpu::Texture, b: IRect, alpha: f32) {
+        let pieces = if tex.width() <= ATLAS_MAX && tex.height() <= ATLAS_MAX {
+            vec![(b, tex)]
+        } else {
+            b.tiles(ATLAS_MAX).into_iter().map(|t| (t, self.eng.gpu.crop(&tex, t.x - b.x, t.y - b.y, t.w, t.h))).collect()
+        };
+        for (t, tex) in pieces {
+            let img = self.register(tex);
+            scene.draw_image(&ImageBrush::new(img).with_alpha(alpha), Affine::translate((t.x as f64, t.y as f64)));
+        }
     }
 
     /// The node blurred, as a premultiplied texture covering `b`.
@@ -293,8 +429,7 @@ impl Pass<'_> {
             }
             if let Some(pb) = p.bounds(n, xf, false)?.and_then(|r| intersect(r, irect(c))).and_then(round_out) {
                 let tex = p.pass(n, xf, pb)?;
-                let img = p.register(tex);
-                scene.draw_image(&ImageBrush::new(img), Affine::translate((pb.x as f64, pb.y as f64)));
+                p.draw_texture(scene, tex, pb, 1.0);
             }
             Ok(())
         })?;
@@ -433,27 +568,33 @@ impl Pass<'_> {
                 }
             }
             Kind::Mask { shape, invert, luminance, children } => {
-                let full = roi.expand();
-                scene.push_layer(Fill::NonZero, Mix::Normal, 1.0, Affine::IDENTITY, &full);
+                // Both layers cover only what the mask can draw. A DestIn/DestOut
+                // layer is a blend level in every tile it covers, and nested past
+                // vello's 4 in-register levels each tile spills to a small fixed
+                // buffer, so a canvas-sized one overflows it on a large render.
+                let Some(clip) = self.bounds(n, xf, false)?.and_then(|r| intersect(r, roi)) else { return Ok(()) };
+                let clip = clip.expand();
+                scene.push_layer(Fill::NonZero, Mix::Normal, 1.0, Affine::IDENTITY, &clip);
                 for c in children {
                     self.encode(scene, c, xf, roi)?;
                 }
                 debug_assert!(!luminance, "luminance masks take the pass path");
                 let compose = if *invert { Compose::DestOut } else { Compose::DestIn };
-                scene.push_layer(Fill::NonZero, BlendMode::new(Mix::Normal, compose), 1.0, Affine::IDENTITY, &full);
+                scene.push_layer(Fill::NonZero, BlendMode::new(Mix::Normal, compose), 1.0, Affine::IDENTITY, &clip);
                 for c in shape {
                     self.encode(scene, c, xf, roi)?;
                 }
                 scene.pop_layer();
                 scene.pop_layer();
             }
-            Kind::Shape { geom, fill, stroke } => {
+            Kind::Shape { geom, fill, stroke, even_odd } => {
                 let mut path = geom_path(geom)?;
                 if self.fine {
                     path = flattened(&path, FIELD_TOLERANCE / scale_of(xf));
                 }
                 if let Some(p) = fill {
-                    scene.fill(Fill::NonZero, xf, &brush(p, alpha), None, &path);
+                    let rule = if *even_odd { Fill::EvenOdd } else { Fill::NonZero };
+                    scene.fill(rule, xf, &brush(p, alpha), None, &path);
                 }
                 if let Some(s) = stroke {
                     scene.stroke(&kurbo_stroke(s), xf, &brush(&s.paint, alpha), None, &path);
@@ -490,7 +631,6 @@ impl Pass<'_> {
             }
             Kind::Image { src, dst, crop, fit } => {
                 let (img, px_per_unit) = self.eng.image(src)?;
-                let img = self.fresh(img);
                 let [dx, dy, dw, dh] = *dst;
                 let [cx, cy, cw, ch] = crop.map(|v| v * px_per_unit);
                 let (mut sx, mut sy, mut sw, mut sh) = (cx, cy, cw, ch);
@@ -508,11 +648,20 @@ impl Pass<'_> {
                     }
                     Fit::Fill => {}
                 }
-                let place = xf
+                let mut place = xf
                     * Affine::translate((tx, ty))
                     * Affine::scale_non_uniform(tw / sw, th / sh)
                     * Affine::translate((-sx, -sy));
-                let cropped = sx > 0.0 || sy > 0.0 || sx + sw < img.width as f64 || sy + sh < img.height as f64;
+                let mut cropped = sx > 0.0 || sy > 0.0 || sx + sw < img.width as f64 || sy + sh < img.height as f64;
+                let img = if img.width > ATLAS_MAX || img.height > ATLAS_MAX {
+                    let (part, at) = atlas_fit(&img, [sx, sy, sw, sh], max_scale_of(place))?;
+                    place *= at;
+                    cropped = true;
+                    part
+                } else {
+                    img
+                };
+                let img = self.fresh(img);
                 if cropped {
                     scene.push_clip_layer(Fill::NonZero, xf, &Rect::new(tx, ty, tx + tw, ty + th));
                 }
@@ -561,7 +710,7 @@ impl Pass<'_> {
             Kind::Shape { geom, stroke, .. } => {
                 let path = geom_path(geom)?;
                 let r = (xf * path).bounding_box();
-                let grow = stroke.as_ref().map_or(0.0, |s| s.width * scale_of(xf) * 0.75);
+                let grow = stroke.as_ref().map_or(0.0, |s| s.width * max_scale_of(xf) * 0.75);
                 Some(r.inflate(grow + 1.0, grow + 1.0))
             }
             Kind::Text(t) => {
