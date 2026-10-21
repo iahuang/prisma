@@ -56,3 +56,4 @@ that a design looks right. Only the render can tell you.
 | `examples/type.luau` | Baseline-aligned type at mixed sizes, a gradient through text, a full-bleed effect via `area` |
 | `examples/transform.luau` | `measure()`-driven layout (chained breadcrumb, pills fit to labels) placed with a sheared `transform` |
 | `examples/logo.luau` | A mark as one `Path` with `fillRule = "evenodd"` (holes without masks), and its construction drawn from the same path as outlines |
+| `examples/refract.luau` | Glass from parts: `Refract` and `Gloss` composed into a lens, water (a `Height` input drawn with noise) and bubbles in frosted glass |

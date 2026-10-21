@@ -49,11 +49,18 @@
   pixels. This keeps each submission's work bounded however big a pass gets.
 - **Fields are data, not pictures.** An effect's `"sdf"` inputs are rendered
   (curves pre-flattened to `FIELD_TOLERANCE`), jump-flooded, and written as
-  `Rgba32Float` `(d, q - p, coverage)` covering the effect's input rect. They
-  are bound as textures 3, 4, ... and never composited through vello, since
-  anything vello composites is RGBA8. The effect bind group layout depends
-  on the number of inputs (`Gpu::effect_layout`). Each input's range rides at
-  the end of the `u` buffer (`prisma_range_NAME`).
+  `Rgba32Float` `(d, q - p, coverage)` covering the effect's input rect.
+  `"height"` inputs are rendered normally, then turned into floats
+  (luminance x alpha x scale), blurred by the `Height`'s `blur` in float and
+  differenced into `(h, dh/dx, dh/dy, alpha)` (`HEIGHT_WGSL`, `Gpu::height_field`).
+  Inputs are bound as textures 3, 4, ... in `EffectDef::inputs` order and never
+  composited through vello, since anything vello composites is RGBA8. An
+  optional input that was left out is bound as a 1x1 texture of its kind's
+  empty value (`Gpu::absent_input`); accessors bound their reads by
+  `textureDimensions`, so every read of it is that value. The effect bind
+  group layout depends on the number of inputs (`Gpu::effect_layout`). Each
+  `"sdf"` input's range rides at the end of the `u` buffer
+  (`prisma_range_NAME`; `ABSENT_RANGE` for a left-out one).
 - **The jump flood** (`SDF_WGSL` in `gpu.rs`) seeds partly covered contour
   pixels at a subpixel edge point (Gustavson & Strand's coverage-to-distance).
   A refine pass fits each seed's edge as the principal axis of its
@@ -133,7 +140,11 @@ cargo test --release
   checks that every example renders (`all_examples_render`), samples exact
   pixels (`basics_pixels`, `sdf_pixels` at scales 1 and 2), measures `"sdf"`
   input precision against an exact polygon (`sdf_input_is_exact`), checks that
-  input slots reject anything but an `Sdf` (`sdf_inputs_are_explicit`), checks a
+  input slots reject anything but an `Sdf` (`sdf_inputs_are_explicit`), measures
+  `"height"` inputs against an exact ramp, with an absent optional input
+  (`height_input_is_exact`), checks their errors (`height_inputs_are_explicit`),
+  checks `Refract` offsets against Snell's law and `Gloss` against Blinn
+  (`refraction_follows_snell`, `tests/fixtures/refract_probe.luau`), checks a
   sheared `transform` (`transform_pixels`) and `measure` against layout
   (`measure_matches_layout`, `tests/fixtures/measure.luau`), and checks crop
   invariance (`crop_matches_full_render`, tolerance 2/255). Even-odd fills

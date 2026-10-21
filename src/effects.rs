@@ -6,10 +6,11 @@
 //! first in the generated module so naga's line numbers match the script's
 //! string; WGSL doesn't care about declaration order.
 //!
-//! Inputs are extra named slots filled at the call site (`body = Sdf { ... }`).
-//! Each one is computed offscreen into a float texture and bound directly, so it
-//! never passes through 8-bit compositing; the prelude generates an accessor
-//! per input (`body(p)`, `body_march(p, dir, maxd)`).
+//! Inputs are extra named slots filled at the call site (`body = Sdf { ... }`,
+//! `surface = Height { ... }`). Each one is computed offscreen into a float
+//! texture and bound directly, so it never passes through 8-bit compositing; the
+//! prelude generates an accessor per input (`body(p)`, `body_march(p, dir, maxd)`,
+//! `surface(p)`). An optional input (kind `"height?"`) left out reads as empty.
 
 use std::collections::BTreeMap;
 
@@ -47,23 +48,63 @@ impl UType {
 pub enum InputKind {
     /// A signed distance field, from an `Sdf { ... }` element.
     Sdf,
+    /// A height map and its gradient, from a `Height { ... }` element.
+    Height,
 }
 
 impl InputKind {
-    pub fn parse(s: &str) -> Result<InputKind> {
-        Ok(match s {
-            "sdf" => InputKind::Sdf,
-            _ => bail!("unknown input kind {s:?} (kinds: sdf)"),
-        })
-    }
-
     /// The element a slot of this kind takes.
     pub fn element(self) -> &'static str {
         match self {
             InputKind::Sdf => "Sdf",
+            InputKind::Height => "Height",
+        }
+    }
+
+    /// "an Sdf", "a Height".
+    pub fn article(self) -> &'static str {
+        match self {
+            InputKind::Sdf => "an",
+            InputKind::Height => "a",
+        }
+    }
+
+    /// The prop that sizes it, for error hints.
+    pub fn key_prop(self) -> &'static str {
+        match self {
+            InputKind::Sdf => "range",
+            InputKind::Height => "scale",
         }
     }
 }
+
+/// An effect's input slot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InputDef {
+    pub name: String,
+    pub kind: InputKind,
+    /// May be left out at the call site (kind written with a trailing `?`).
+    pub optional: bool,
+}
+
+impl InputDef {
+    /// `kind` as written in `inputs = { name = kind }`: `"sdf"`, `"height"`, `"height?"`, ...
+    pub fn parse(name: &str, kind: &str) -> Result<InputDef> {
+        let (base, optional) = match kind.strip_suffix('?') {
+            Some(b) => (b, true),
+            None => (kind, false),
+        };
+        let kind = match base {
+            "sdf" => InputKind::Sdf,
+            "height" => InputKind::Height,
+            _ => bail!("unknown input kind {kind:?} (kinds: sdf, height; add ? to make the input optional, e.g. \"height?\")"),
+        };
+        Ok(InputDef { name: name.to_string(), kind, optional })
+    }
+}
+
+/// The range an absent optional `"sdf"` input reports: everywhere is this far outside.
+pub const ABSENT_RANGE: f32 = 1e6;
 
 /// Names the prelude defines, which inputs can't take.
 const RESERVED: &[&str] = &["src", "src_doc", "to_doc", "to_px", "pm", "unpm", "luma", "rot", "sdf_dist", "hash", "hash3", "vnoise", "fbm", "effect", "sys", "u"];
@@ -83,7 +124,7 @@ pub struct EffectDef {
     /// Sorted by name; colors are laid out first in the uniform struct.
     pub uniforms: Vec<(String, UType, UValue)>,
     /// Sorted by name; bound as textures 3, 4, ... in this order.
-    pub inputs: Vec<(String, InputKind)>,
+    pub inputs: Vec<InputDef>,
     /// How far beyond what it draws the shader reads `src` and its inputs.
     pub reach: Margin,
     /// How far beyond its children (and inputs' children) it draws, without `area`.
@@ -118,13 +159,13 @@ impl EffectDef {
     pub fn new(
         name: String,
         mut uniforms: Vec<(String, UType, UValue)>,
-        mut inputs: Vec<(String, InputKind)>,
+        mut inputs: Vec<InputDef>,
         reach: Margin,
         grow: Margin,
         wgsl: String,
     ) -> Result<EffectDef> {
         uniforms.sort_by(|a, b| a.0.cmp(&b.0));
-        inputs.sort_by(|a, b| a.0.cmp(&b.0));
+        inputs.sort_by(|a, b| a.name.cmp(&b.name));
         for (field, m) in [("reach", &reach), ("grow", &grow)] {
             if let Margin::Uniform(u) = m {
                 match uniforms.iter().find(|(n, ..)| n == u) {
@@ -136,7 +177,7 @@ impl EffectDef {
                 }
             }
         }
-        for (n, _) in &inputs {
+        for InputDef { name: n, .. } in &inputs {
             if uniforms.iter().any(|(u, ..)| u == n) {
                 bail!("effect {name:?}: {n:?} is both a uniform and an input");
             }
@@ -150,7 +191,7 @@ impl EffectDef {
     }
 
     /// Bytes for the `u` uniform buffer, in the layout `prelude` declares.
-    /// `ranges` are the field inputs' ranges in device px, in input order.
+    /// `ranges` are the `"sdf"` inputs' ranges in device px, in input order.
     pub fn pack(&self, values: &[(String, UValue)], ranges: &[f32], scale: f64) -> Vec<u8> {
         let mut colors = Vec::new();
         let mut floats = Vec::new();
@@ -207,7 +248,7 @@ pub struct Sys {
     pub _pad1: [f32; 2],
 }
 
-fn prelude(uniforms: &[(String, UType, UValue)], inputs: &[(String, InputKind)]) -> String {
+fn prelude(uniforms: &[(String, UType, UValue)], inputs: &[InputDef]) -> String {
     let mut fields = String::new();
     for (n, ..) in uniforms.iter().filter(|u| u.1 == UType::Color) {
         fields += &format!("  {n}: vec4f,\n");
@@ -215,20 +256,25 @@ fn prelude(uniforms: &[(String, UType, UValue)], inputs: &[(String, InputKind)])
     for (n, ..) in uniforms.iter().filter(|u| u.1 != UType::Color) {
         fields += &format!("  {n}: f32,\n");
     }
-    for (n, _) in inputs {
-        fields += &format!("  prisma_range_{n}: f32,\n");
+    for i in inputs.iter().filter(|i| i.kind == InputKind::Sdf) {
+        fields += &format!("  prisma_range_{}: f32,\n", i.name);
     }
     if fields.is_empty() {
         fields = "  _unused: vec4f,\n".into();
     }
     let mut accessors = String::new();
-    if !inputs.is_empty() {
+    if inputs.iter().any(|i| i.kind == InputKind::Sdf) {
         accessors += SDF_SAMPLE;
     }
-    for (k, (n, kind)) in inputs.iter().enumerate() {
-        match kind {
-            InputKind::Sdf => accessors += &SDF_ACCESSOR.replace("NAME", n).replace("BINDING", &(3 + k).to_string()),
-        }
+    if inputs.iter().any(|i| i.kind == InputKind::Height) {
+        accessors += HEIGHT_SAMPLE;
+    }
+    for (k, i) in inputs.iter().enumerate() {
+        let template = match i.kind {
+            InputKind::Sdf => SDF_ACCESSOR,
+            InputKind::Height => HEIGHT_ACCESSOR,
+        };
+        accessors += &template.replace("NAME", &i.name).replace("BINDING", &(3 + k).to_string());
     }
     format!("// ---- prisma prelude ----\nstruct U {{\n{fields}}}\n{PRELUDE}{accessors}")
 }
@@ -247,7 +293,7 @@ struct SdfSample {
 const SDF_ACCESSOR: &str = r#"
 @group(0) @binding(BINDING) var prisma_in_NAME: texture_2d<f32>;
 fn prisma_NAME_texel(i: vec2i) -> vec4f {
-  if (any(i < vec2i(0)) || any(i >= vec2i(sys.src_size))) { return vec4f(-u.prisma_range_NAME, 0.0, 0.0, 0.0); }
+  if (any(i < vec2i(0)) || any(i >= vec2i(textureDimensions(prisma_in_NAME)))) { return vec4f(-u.prisma_range_NAME, 0.0, 0.0, 0.0); }
   return textureLoad(prisma_in_NAME, i, 0);
 }
 // (d, q - p, cover), bilinear.
@@ -300,6 +346,39 @@ fn NAME_march(p: vec2f, dir: vec2f, maxd: f32) -> f32 {
     t += max(d, 1.0);
   }
   return min(t, maxd);
+}
+"#;
+
+const HEIGHT_SAMPLE: &str = r#"
+// One read of a Height input, device px like p.
+struct HeightSample {
+  h: f32,       // height: the children's luminance x alpha times the Height's scale (after its blur)
+  g: vec2f,     // gradient of h (px of height per px across): the surface's slope
+  cover: f32,   // the children's alpha (after the blur)
+}
+"#;
+
+// Per Height input NAME at texture BINDING: (h, dh/dx, dh/dy, alpha), covering
+// the same rect as src. Outside it, and everywhere for an absent optional input
+// (a 1x1 zero texture), the height is 0.
+const HEIGHT_ACCESSOR: &str = r#"
+@group(0) @binding(BINDING) var prisma_in_NAME: texture_2d<f32>;
+fn prisma_NAME_texel(i: vec2i) -> vec4f {
+  if (any(i < vec2i(0)) || any(i >= vec2i(textureDimensions(prisma_in_NAME)))) { return vec4f(0.0); }
+  return textureLoad(prisma_in_NAME, i, 0);
+}
+fn NAME(p: vec2f) -> HeightSample {
+  let q = p - sys.src_origin - 0.5;
+  let i = vec2i(floor(q));
+  let f = q - floor(q);
+  let a = mix(prisma_NAME_texel(i), prisma_NAME_texel(i + vec2i(1, 0)), f.x);
+  let b = mix(prisma_NAME_texel(i + vec2i(0, 1)), prisma_NAME_texel(i + vec2i(1, 1)), f.x);
+  let v = mix(a, b, f.y);
+  var s: HeightSample;
+  s.h = v.x;
+  s.g = v.yz;
+  s.cover = v.w;
+  return s;
 }
 "#;
 

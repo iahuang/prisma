@@ -20,14 +20,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use mlua::{Lua, Table, UserData, UserDataFields, UserDataMethods, Value, VmState};
 use vello::kurbo::{Affine, BezPath, Rect, Shape};
 
-use crate::effects::{EffectDef, InputKind, Margin, UType};
+use crate::effects::{EffectDef, InputDef, InputKind, Margin, UType};
 use crate::engine::{Engine, Raster};
 use crate::ir::{Align, Anchor, Blend, Cap, Document, Fit, Font, Geom, ImageSrc, Join, Kind, Node, Paint, Stroke, Text, UValue};
 use crate::units::{Rgba, parse_color, parse_length};
 
 const PRELUDE: &str = include_str!("prelude.luau");
 
-const PRIMITIVES: &[&str] = &["Canvas", "Group", "Mask", "Rect", "Circle", "Ellipse", "Line", "Path", "Text", "Image", "Sdf"];
+const PRIMITIVES: &[&str] = &["Canvas", "Group", "Mask", "Rect", "Circle", "Ellipse", "Line", "Path", "Text", "Image", "Sdf", "Height"];
 
 pub struct RunOptions {
     pub seed: u64,
@@ -418,7 +418,7 @@ fn parse_effect(t: &Table) -> Result<EffectDef> {
                 bail!("input name {k:?} is taken by the prop every effect has (opacity, blend, blur, id, area)");
             }
             let Value::String(kind) = kind else { bail!("input {k:?}: give its kind as a string, e.g. {k} = \"sdf\"") };
-            inputs.push((k.clone(), InputKind::parse(&kind.to_str()?).with_context(|| format!("input {k:?}"))?));
+            inputs.push(InputDef::parse(&k, &kind.to_str()?).with_context(|| format!("input {k:?}"))?);
         }
     }
     if !t.get::<Value>("pad")?.is_nil() {
@@ -760,6 +760,9 @@ impl Conv<'_> {
                         self.nodes(c, out)?;
                     }
                     Ok(())
+                } else if t.raw_get::<Option<String>>("_op")?.as_deref() == Some("Height") {
+                    let at: String = t.raw_get::<Option<String>>("_at")?.unwrap_or_default();
+                    bail!("{at}: Height is data for an effect's height input, not something drawn (e.g. surface = Height {{ scale = 4, ... }})")
                 } else {
                     out.push(self.node(t)?);
                     Ok(())
@@ -807,18 +810,22 @@ impl Conv<'_> {
     }
 
     /// An effect's input slot: exactly the element its kind takes, never converted.
-    fn input(&self, p: &Props, effect: &str, input: &str, kind: InputKind) -> Result<Node> {
+    /// None for an optional input that was left out.
+    fn input(&self, p: &Props, effect: &str, def: &InputDef) -> Result<Option<Node>> {
+        let (input, kind) = (def.name.as_str(), def.kind);
         let want = kind.element();
-        let hint = format!("wrap it: {input} = {want} {{ range = ..., ... }}");
+        let an = kind.article();
+        let hint = format!("wrap it: {input} = {want} {{ {} = ..., ... }}", kind.key_prop());
         let t = match p.t.raw_get::<Option<Value>>(input)? {
-            None => return Err(p.err(format!("{effect}: missing input `{input}` (an {want} {{ ... }})"))),
+            None if def.optional => return Ok(None),
+            None => return Err(p.err(format!("{effect}: missing input `{input}` ({an} {want} {{ ... }})"))),
             Some(Value::Table(t)) => t,
-            Some(v) => return Err(p.err(format!("{effect}: input `{input}` expects an {want}, got {} ({hint})", type_name(&v)))),
+            Some(v) => return Err(p.err(format!("{effect}: input `{input}` expects {an} {want}, got {} ({hint})", type_name(&v)))),
         };
         match t.raw_get::<Option<String>>("_op")? {
             Some(op) if op == want => {}
-            Some(op) => return Err(p.err(format!("{effect}: input `{input}` expects an {want}, got {op} ({hint})"))),
-            None => return Err(p.err(format!("{effect}: input `{input}` expects an {want}, got a list ({hint})"))),
+            Some(op) => return Err(p.err(format!("{effect}: input `{input}` expects {an} {want}, got {op} ({hint})"))),
+            None => return Err(p.err(format!("{effect}: input `{input}` expects {an} {want}, got a list ({hint})"))),
         }
         let at: String = t.raw_get::<Option<String>>("_at")?.unwrap_or_default();
         for k in ["fill", "opacity", "blend"] {
@@ -826,10 +833,28 @@ impl Conv<'_> {
                 bail!("{at}: {want}: `{k}` has no effect on an effect input (it is read as data, not drawn); remove it");
             }
         }
-        if !t.raw_get::<Value>("blur")?.is_nil() {
-            bail!("{at}: {want}: `blur` on an effect input is not supported yet");
+        match kind {
+            InputKind::Sdf if !t.raw_get::<Value>("blur")?.is_nil() => {
+                bail!("{at}: {want}: `blur` on an effect input is not supported yet");
+            }
+            InputKind::Sdf => self.node(t).map(Some),
+            InputKind::Height => self.height(t).map(Some),
         }
-        self.node(t)
+    }
+
+    /// A `Height` element, which only exists in an effect's height input slot.
+    fn height(&self, t: Table) -> Result<Node> {
+        let at: String = t.raw_get::<Option<String>>("_at")?.unwrap_or_default();
+        let p = Props { t, op: "Height".into(), at: at.clone(), known: RefCell::default() };
+        let (opacity, blend, blur) = p.common()?;
+        p.raw("id")?;
+        let scale = p.len("scale")?.ok_or_else(|| p.err("missing `scale` (how many doc px high white is, e.g. scale = 4)"))?;
+        if scale == 0.0 {
+            return Err(p.err("`scale` can't be 0 (it is how many doc px high white is)"));
+        }
+        let children = self.child_nodes(&p)?;
+        p.finish()?;
+        Ok(Node { kind: Kind::Height { scale, children }, opacity, blend, blur, at })
     }
 
     fn node(&self, t: Table) -> Result<Node> {
@@ -1021,10 +1046,12 @@ impl Conv<'_> {
                 }
                 let def_inputs = def.inputs.clone();
                 let mut names: Vec<String> = def.uniforms.iter().map(|(n, ..)| n.clone()).collect();
-                names.extend(def_inputs.iter().map(|(n, _)| n.clone()));
+                names.extend(def_inputs.iter().map(|i| i.name.clone()));
                 let mut inputs = Vec::new();
-                for (input, kind) in &def_inputs {
-                    inputs.push((input.clone(), self.input(&p, &name, input, *kind)?));
+                for i in &def_inputs {
+                    if let Some(node) = self.input(&p, &name, i)? {
+                        inputs.push((i.name.clone(), node));
+                    }
                 }
                 for (field, m) in [("reach", &def.reach), ("grow", &def.grow)] {
                     if let crate::effects::Margin::Uniform(u) = m
@@ -1095,7 +1122,11 @@ mod tests {
         let def = |src: &str| parse_effect(&lua.load(src).eval::<Table>().unwrap());
         let ok = def(r#"{ inputs = { body = "sdf" }, wgsl = "fn effect(p: vec2f) -> vec4f { let f = body(p); return vec4f(f.d, f.n, body_march(p, vec2f(0.0, 1.0), 9.0)); }" }"#);
         assert!(ok.is_ok_and(|d| d.inputs.len() == 1));
+        let both = def(r#"{ inputs = { body = "sdf?", surface = "height" }, wgsl = "fn effect(p: vec2f) -> vec4f { let s = surface(p); return vec4f(s.h, s.g, s.cover + body(p).d); }" }"#).unwrap();
+        let kinds: Vec<_> = both.inputs.iter().map(|i| (i.name.as_str(), i.kind, i.optional)).collect();
+        assert_eq!(kinds, [("body", InputKind::Sdf, true), ("surface", InputKind::Height, false)]);
         let err = |src: &str| format!("{:#}", def(src).unwrap_err());
+        assert!(err(r#"{ inputs = { body = "height??" }, wgsl = "fn effect(p: vec2f) -> vec4f { return src(p); }" }"#).contains("unknown input kind"));
         assert!(err(r#"{ inputs = { body = "blur" }, wgsl = "fn effect(p: vec2f) -> vec4f { return src(p); }" }"#).contains("unknown input kind"));
         assert!(err(r#"{ inputs = { blur = "sdf" }, wgsl = "fn effect(p: vec2f) -> vec4f { return src(p); }" }"#).contains("\"blur\" is taken"));
         assert!(err(r#"{ inputs = { hash = "sdf" }, wgsl = "fn effect(p: vec2f) -> vec4f { return src(p); }" }"#).contains("taken by the prelude"));

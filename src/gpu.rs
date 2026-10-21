@@ -159,6 +159,10 @@ pub struct Gpu {
     sdf_final: wgpu::RenderPipeline,
     sdf_field: wgpu::RenderPipeline,
     sdf_preview: wgpu::RenderPipeline,
+    height_init: wgpu::RenderPipeline,
+    height_blur: wgpu::RenderPipeline,
+    height_field: wgpu::RenderPipeline,
+    height_preview: wgpu::RenderPipeline,
     /// Bind group and pipeline layouts for effects, by number of field inputs.
     effect_layouts: HashMap<usize, (wgpu::BindGroupLayout, wgpu::PipelineLayout)>,
 }
@@ -501,6 +505,69 @@ fn signed(fc: vec4f) -> vec4f {
 }
 "#;
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct HeightParams {
+    dir: [f32; 2],
+    sigma: f32,
+    radius: f32,
+    /// Output origin minus input origin, device px.
+    offset: [f32; 2],
+    /// Device px of height that white stands for.
+    scale: f32,
+    _pad: f32,
+}
+
+// Height inputs. `init` turns the rendered children (straight RGBA8) into
+// floats (luminance x alpha x scale, alpha); `blur` smooths them, one axis per
+// pass, still in float, which is what removes the 8-bit steps; `field` writes
+// the effect input (h, dh/dx, dh/dy, alpha) by central differences.
+const HEIGHT_WGSL: &str = r#"
+struct H { dir: vec2f, sigma: f32, radius: f32, offset: vec2f, scale: f32, _pad: f32 }
+@group(0) @binding(0) var<uniform> h: H;
+@group(0) @binding(1) var t: texture_2d<f32>;
+
+fn load(i: vec2i) -> vec4f {
+  if (any(i < vec2i(0)) || any(i >= vec2i(textureDimensions(t)))) { return vec4f(0.0); }
+  return textureLoad(t, i, 0);
+}
+
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+  return vec4f(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment fn init(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  let c = load(vec2i(floor(fc.xy)));
+  return vec4f(dot(c.rgb, vec3f(0.2126, 0.7152, 0.0722)) * c.a * h.scale, 0.0, 0.0, c.a);
+}
+
+@fragment fn blur(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  let i = vec2i(floor(fc.xy));
+  let d = vec2i(h.dir);
+  var acc = vec4f(0.0);
+  var wsum = 0.0;
+  for (var k = -i32(h.radius); k <= i32(h.radius); k++) {
+    let w = exp(-f32(k * k) / (2.0 * h.sigma * h.sigma));
+    acc += load(i + d * k) * w;
+    wsum += w;
+  }
+  return acc / wsum;
+}
+
+@fragment fn field(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  let i = vec2i(floor(fc.xy + h.offset));
+  let g = vec2f(load(i + vec2i(1, 0)).x - load(i - vec2i(1, 0)).x, load(i + vec2i(0, 1)).x - load(i - vec2i(0, 1)).x) * 0.5;
+  let c = load(i);
+  return vec4f(c.x, g, c.w);
+}
+
+// A viewable --dump of a height input: gray = h / scale.
+@fragment fn preview(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  return vec4f(vec3f(clamp(load(vec2i(floor(fc.xy))).x / h.scale, 0.0, 1.0)), 1.0);
+}
+"#;
+
 fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -616,6 +683,14 @@ impl Gpu {
         let sdf_final = fullscreen_pipeline(&device, &blur_pl, &sdf_module, "vs", "finish", wgpu::TextureFormat::Rgba8Unorm);
         let sdf_field = fullscreen_pipeline(&device, &blur_pl, &sdf_module, "vs", "field", wgpu::TextureFormat::Rgba32Float);
         let sdf_preview = fullscreen_pipeline(&device, &blur_pl, &sdf_module, "vs", "preview", wgpu::TextureFormat::Rgba8Unorm);
+        let height_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("height"),
+            source: wgpu::ShaderSource::Wgsl(HEIGHT_WGSL.into()),
+        });
+        let height_init = fullscreen_pipeline(&device, &blur_pl, &height_module, "vs", "init", wgpu::TextureFormat::Rgba32Float);
+        let height_blur = fullscreen_pipeline(&device, &blur_pl, &height_module, "vs", "blur", wgpu::TextureFormat::Rgba32Float);
+        let height_field = fullscreen_pipeline(&device, &blur_pl, &height_module, "vs", "field", wgpu::TextureFormat::Rgba32Float);
+        let height_preview = fullscreen_pipeline(&device, &blur_pl, &height_module, "vs", "preview", wgpu::TextureFormat::Rgba8Unorm);
 
         Ok(Gpu {
             device,
@@ -636,6 +711,10 @@ impl Gpu {
             sdf_final,
             sdf_field,
             sdf_preview,
+            height_init,
+            height_blur,
+            height_field,
+            height_preview,
             effect_layouts: HashMap::new(),
         })
     }
@@ -993,6 +1072,46 @@ impl Gpu {
         let params = Self::sdf_params(src, dst, 0, range, [0.0; 4]);
         self.run_pass(&self.sdf_field, &self.bind(&self.blur_layout, bytemuck::bytes_of(&params), &flood), &out);
         out
+    }
+
+    /// A height map input: `input` (straight, covering `src`) as an Rgba32Float
+    /// texture covering `dst` of (h, dh/dx, dh/dy, alpha), with h = luminance x
+    /// alpha x `scale` (device px), smoothed by a gaussian of `sigma` (device px)
+    /// in float. `src` should extend 3 sigma + 1 beyond `dst`.
+    pub fn height_field(&self, input: &wgpu::Texture, src: IRect, dst: IRect, scale: f32, sigma: f32) -> wgpu::Texture {
+        let params = |dir: [f32; 2], offset: [f32; 2]| HeightParams { dir, sigma, radius: (sigma * 3.0).ceil(), offset, scale, _pad: 0.0 };
+        let a = self.pass_target(src.w, src.h, wgpu::TextureFormat::Rgba32Float);
+        self.run_pass(&self.height_init, &self.bind(&self.blur_layout, bytemuck::bytes_of(&params([0.0; 2], [0.0; 2])), input), &a);
+        if sigma > 0.0 {
+            let b = self.pass_target(src.w, src.h, wgpu::TextureFormat::Rgba32Float);
+            self.run_pass(&self.height_blur, &self.bind(&self.blur_layout, bytemuck::bytes_of(&params([1.0, 0.0], [0.0; 2])), &a), &b);
+            self.run_pass(&self.height_blur, &self.bind(&self.blur_layout, bytemuck::bytes_of(&params([0.0, 1.0], [0.0; 2])), &b), &a);
+        }
+        let out = self.pass_target(dst.w, dst.h, wgpu::TextureFormat::Rgba32Float);
+        let offset = [(dst.x - src.x) as f32, (dst.y - src.y) as f32];
+        self.run_pass(&self.height_field, &self.bind(&self.blur_layout, bytemuck::bytes_of(&params([0.0; 2], offset)), &a), &out);
+        out
+    }
+
+    /// A viewable Rgba8 picture of a height input from `height_field`, for --dump.
+    pub fn height_preview(&self, field: &wgpu::Texture, scale: f32) -> wgpu::Texture {
+        let out = self.pass_target(field.width(), field.height(), wgpu::TextureFormat::Rgba8Unorm);
+        let params = HeightParams { dir: [0.0; 2], sigma: 0.0, radius: 0.0, offset: [0.0; 2], scale, _pad: 0.0 };
+        self.run_pass(&self.height_preview, &self.bind(&self.blur_layout, bytemuck::bytes_of(&params), field), &out);
+        out
+    }
+
+    /// The 1x1 stand-in bound for an optional input that was left out. Every read
+    /// of it (in bounds or not) gives `texel`, the input kind's "nothing here".
+    pub fn absent_input(&self, texel: [f32; 4]) -> wgpu::Texture {
+        let tex = self.texture(1, 1, wgpu::TextureFormat::Rgba32Float, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        self.queue.write_texture(
+            tex.as_image_copy(),
+            bytemuck::cast_slice(&texel),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(16), rows_per_image: None },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        tex
     }
 
     /// A viewable Rgba8 picture of a field from `sdf_field`, for --dump.

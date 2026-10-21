@@ -19,6 +19,7 @@ use vello::kurbo::{self, Affine, BezPath, Rect, Shape};
 use vello::peniko::{self, Blob, BlendMode, Brush, Compose, Fill, Gradient, ImageAlphaType, ImageBrush, ImageData, ImageFormat, Mix};
 use vello::{Scene, wgpu};
 
+use crate::effects::{ABSENT_RANGE, InputKind};
 use crate::engine::Engine;
 use crate::gpu::{BumpCheck, IRect, MaskMode, Overflow};
 use crate::ir::{Blend, Cap, Document, Fit, Geom, Join, Kind, Node, Paint, Stroke};
@@ -521,24 +522,51 @@ impl<'a> Pass<'a> {
         let c = self.read_rect(b, def.reach_px(uniforms, self.scale).ceil() as u32);
         let scene = self.scene(|p, s| children.iter().try_for_each(|child| p.encode(s, child, xf, irect(c))))?;
         let input = self.render_region(&scene, c)?;
-        // Field inputs cover the same rect as the children, so `body(p)` reads wherever `src(p)` does.
+        // Inputs cover the same rect as the children, so `body(p)` reads wherever `src(p)` does.
         let (mut fields, mut ranges) = (Vec::new(), Vec::new());
-        for (name, node) in inputs {
-            let Kind::Sdf { range, children, .. } = &node.kind else { unreachable!("inputs are checked to be Sdf elements") };
-            let range_px = range * scale_of(xf);
-            // Contours up to `range` outside the rect still count, as for a drawn Sdf.
-            let fc = self.read_rect(c, range_px.ceil() as u32 + 1);
-            let scene = self.field_scene(children, xf, fc)?;
-            let shape = self.render_region(&scene, fc)?;
-            self.offscreen_passes += 1;
-            let field = self.eng.gpu.sdf_field(&shape, fc, c, range_px as f32);
-            self.dump(node, &format!("{effect}-{name}-in"), &shape, false)?;
-            if self.eng.dump_dir.is_some() {
-                let preview = self.eng.gpu.field_preview(&field, range_px as f32);
-                self.dump(node, &format!("{effect}-{name}-field"), &preview, false)?;
+        for input in &def.inputs {
+            let name = &input.name;
+            let node = inputs.iter().find(|(n, _)| n == name).map(|(_, node)| node);
+            match (input.kind, node) {
+                (InputKind::Sdf, None) => {
+                    fields.push(self.eng.gpu.absent_input([-ABSENT_RANGE, 0.0, 0.0, 0.0]));
+                    ranges.push(ABSENT_RANGE);
+                }
+                (InputKind::Height, None) => fields.push(self.eng.gpu.absent_input([0.0; 4])),
+                (InputKind::Sdf, Some(node)) => {
+                    let Kind::Sdf { range, children, .. } = &node.kind else { unreachable!("sdf inputs are checked to be Sdf elements") };
+                    let range_px = range * scale_of(xf);
+                    // Contours up to `range` outside the rect still count, as for a drawn Sdf.
+                    let fc = self.read_rect(c, range_px.ceil() as u32 + 1);
+                    let scene = self.field_scene(children, xf, fc)?;
+                    let shape = self.render_region(&scene, fc)?;
+                    self.offscreen_passes += 1;
+                    let field = self.eng.gpu.sdf_field(&shape, fc, c, range_px as f32);
+                    self.dump(node, &format!("{effect}-{name}-in"), &shape, false)?;
+                    if self.eng.dump_dir.is_some() {
+                        let preview = self.eng.gpu.field_preview(&field, range_px as f32);
+                        self.dump(node, &format!("{effect}-{name}-field"), &preview, false)?;
+                    }
+                    fields.push(field);
+                    ranges.push(range_px as f32);
+                }
+                (InputKind::Height, Some(node)) => {
+                    let Kind::Height { scale, children } = &node.kind else { unreachable!("height inputs are checked to be Height elements") };
+                    let (scale_px, sigma) = (scale * scale_of(xf), node.blur * scale_of(xf));
+                    // The blur and the gradient's neighbours read past the rect.
+                    let hc = self.read_rect(c, (sigma * 3.0).ceil() as u32 + 1);
+                    let scene = self.scene(|p, s| children.iter().try_for_each(|child| p.encode(s, child, xf, irect(hc))))?;
+                    let map = self.render_region(&scene, hc)?;
+                    self.offscreen_passes += 1;
+                    let field = self.eng.gpu.height_field(&map, hc, c, scale_px as f32, sigma as f32);
+                    self.dump(node, &format!("{effect}-{name}-in"), &map, false)?;
+                    if self.eng.dump_dir.is_some() {
+                        let preview = self.eng.gpu.height_preview(&field, scale_px as f32);
+                        self.dump(node, &format!("{effect}-{name}-field"), &preview, false)?;
+                    }
+                    fields.push(field);
+                }
             }
-            fields.push(field);
-            ranges.push(range_px as f32);
         }
         let packed = def.pack(uniforms, &ranges, self.scale);
         self.offscreen_passes += 1;
@@ -699,6 +727,7 @@ impl<'a> Pass<'a> {
                 }
             }
             Kind::Effect { .. } | Kind::Sdf { .. } => unreachable!("effects and distance fields are always offscreen"),
+            Kind::Height { .. } => unreachable!("Height only exists as an effect input"),
         }
         Ok(())
     }
@@ -752,13 +781,20 @@ impl<'a> Pass<'a> {
                 let grow = self.eng.effects.get(effect)?.grow_px(uniforms, self.scale);
                 let mut r = union(self, children, xf)?;
                 for (_, node) in inputs {
-                    let Kind::Sdf { children, .. } = &node.kind else { unreachable!("inputs are checked to be Sdf elements") };
+                    // A height map's blur spreads it; a field's spread is data (see above).
+                    let (children, spread) = match &node.kind {
+                        Kind::Sdf { children, .. } => (children, 0.0),
+                        Kind::Height { children, .. } => (children, node.blur * scale_of(xf) * 3.0),
+                        _ => unreachable!("inputs are checked to be Sdf or Height elements"),
+                    };
                     if let Some(i) = union(self, children, xf)? {
+                        let i = i.inflate(spread, spread);
                         r = Some(r.map_or(i, |r| r.union(i)));
                     }
                 }
                 r.map(|r| r.inflate(grow, grow))
             }
+            Kind::Height { .. } => unreachable!("Height only exists as an effect input"),
             // Beyond `range` outside the children the field is 0, i.e. transparent.
             Kind::Sdf { range, children, .. } => {
                 let grow = range * scale_of(xf) + 1.0;

@@ -80,7 +80,8 @@ pub enum Kind {
         /// Where the effect draws, in local doc px. None = the children's bounds plus pad.
         #[serde(skip_serializing_if = "Option::is_none")]
         area: Option<[f64; 4]>,
-        /// Filled input slots, in the effect's input order: (name, an `Sdf` node).
+        /// Filled input slots, in the effect's input order: (name, an `Sdf` or
+        /// `Height` node). An optional input that was left out is absent.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         inputs: Vec<(String, Node)>,
         children: Vec<Node>,
@@ -91,6 +92,13 @@ pub enum Kind {
         /// Doc px.
         range: f64,
         fill: Rgba,
+        children: Vec<Node>,
+    },
+    /// A height map, only ever an effect's input: the children's luminance x
+    /// alpha times `scale`, smoothed by the node's `blur`.
+    Height {
+        /// Doc px of height that white stands for.
+        scale: f64,
         children: Vec<Node>,
     },
 }
@@ -270,7 +278,7 @@ impl Node {
     pub fn walk(&self, f: &mut impl FnMut(&Node)) {
         f(self);
         match &self.kind {
-            Kind::Group { children, .. } | Kind::Sdf { children, .. } => children.iter().for_each(|c| c.walk(f)),
+            Kind::Group { children, .. } | Kind::Sdf { children, .. } | Kind::Height { children, .. } => children.iter().for_each(|c| c.walk(f)),
             Kind::Effect { inputs, children, .. } => {
                 inputs.iter().map(|(_, n)| n).chain(children).for_each(|c| c.walk(f))
             }

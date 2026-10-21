@@ -27,7 +27,7 @@ fn render(example: &str, extra: &[&str]) -> image::RgbaImage {
 
 #[test]
 fn all_examples_render() {
-    for ex in ["basics", "poster", "halftone", "a-grid", "dracula", "outline", "sdf", "field", "type", "transform", "logo"] {
+    for ex in ["basics", "poster", "halftone", "a-grid", "dracula", "outline", "sdf", "field", "type", "transform", "logo", "refract"] {
         render(ex, &[]);
     }
 }
@@ -74,6 +74,11 @@ fn crop_matches_full_render() {
     assert_crop_matches("type", "300,250,60,60");
     // A sheared group's edge.
     assert_crop_matches("transform", "590,290,80,60");
+    // Refraction reading across the crop's edge: a lens rim, rippled water
+    // (a Height input), and frosted glass with bubbles.
+    assert_crop_matches("refract", "20,150,60,60");
+    assert_crop_matches("refract", "400,120,60,60");
+    assert_crop_matches("refract", "700,200,60,60");
 }
 
 #[test]
@@ -428,5 +433,66 @@ fn explicit_rules_reject() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success() && err.contains(want), "{case}: {err}");
         assert!(err.contains("explicit.luau:"), "{case}: no script location in {err}");
+    }
+}
+
+#[test]
+fn height_input_is_exact() {
+    // Every tested pixel encodes its own errors against the exact ramp (see the fixture).
+    for scale in ["1", "2"] {
+        let img = render_script("tests/fixtures/height_probe.luau", &["--scale", scale, "-p", "blur=4"]);
+        let tested: Vec<[f32; 3]> = img.pixels().filter(|p| p.0[3] == 255).map(|p| [0, 1, 2].map(|c| p.0[c] as f32 / 255.0)).collect();
+        assert!(tested.len() > 30_000, "scale {scale}: only {} pixels tested", tested.len());
+        let worst = |c: usize| tested.iter().map(|e| e[c]).fold(0.0, f32::max);
+        let (h, gx, gy) = (worst(0), worst(1) * 5.0, worst(2) * 5.0);
+        println!("scale {scale}: {} px; max h error {h:.2}% of scale, slope {gx:.2}% along, {gy:.2}% across", tested.len());
+        assert!(h <= 0.6, "scale {scale}: height off by up to {h:.2}% of scale");
+        assert!(gx <= 2.5, "scale {scale}: slope off by up to {gx:.2}%");
+        // Also 1 (= 5%) if the absent optional input read as anything but empty.
+        assert!(gy <= 2.5, "scale {scale}: slope across the ramp up to {gy:.2}% (or the absent input wasn't empty)");
+    }
+}
+
+#[test]
+fn refraction_follows_snell() {
+    // A 45-degree chamfer at ior 1.5 bends the view by 45 - asin(sin 45 / 1.5) =
+    // 16.87 degrees, so it reads tan(16.87) = 0.3033 x the height away, inward.
+    for scale in ["1", "2"] {
+        let k: u32 = scale.parse().unwrap();
+        let img = render_script("tests/fixtures/refract_probe.luau", &["--scale", scale]);
+        let red = |x: u32| img.get_pixel(x * k, 50 * k).0[0] as f32;
+        let at = |x: u32| red(x) - red(20) + 20.0; // where the ramp was read, in doc px
+        for (x, want) in [(70, 70.0 + 0.3033 * 20.0), (80, 80.0 + 0.3033 * 30.0), (150, 150.0), (230, 230.0 - 0.3033 * 20.0)] {
+            let got = at(x);
+            assert!((got - want).abs() <= 1.5, "scale {scale}: x = {x} read the backdrop at {got}, want {want:.1}");
+        }
+        // Gloss with the light overhead and shininess 2: (n . up)^2 = cos(45)^2 = 0.5 on the chamfer.
+        let img = render_script("tests/fixtures/refract_probe.luau", &["--scale", scale, "-p", "case=gloss"]);
+        let green = |x: u32| img.get_pixel(x * k, 50 * k).0[1] as i32;
+        assert_eq!(green(30), 0, "scale {scale}: gloss outside the body");
+        assert!((green(70) - 128).abs() <= 2, "scale {scale}: gloss on the chamfer is {}, want cos(45)^2 = 0.5", green(70));
+        assert!(green(150) >= 254, "scale {scale}: gloss on the flat top is {}", green(150));
+    }
+}
+
+#[test]
+fn height_inputs_are_explicit() {
+    let run = |case: &str| prisma("tests/fixtures/height_errors.luau", &["-p", &format!("case={case}")]).1;
+    // `extra` is optional and left out throughout.
+    assert!(run("ok").status.success(), "{}", String::from_utf8_lossy(&run("ok").stderr));
+    for (case, want) in [
+        ("missing", "missing input `surface` (a Height { ... })"),
+        ("bare", "input `surface` expects a Height, got Rect (wrap it: surface = Height { scale = ..."),
+        ("sdf", "expects a Height, got Sdf"),
+        ("drawn", "Height is data for an effect's height input, not something drawn"),
+        ("noscale", "Height: missing `scale` (how many doc px high white is"),
+        ("zero", "`scale` can't be 0"),
+        ("fill", "`fill` has no effect on an effect input"),
+        ("typo", "unknown prop `blurr` (did you mean `blur`?)"),
+    ] {
+        let out = run(case);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && err.contains(want), "{case}: {err}");
+        assert!(err.contains("height_errors.luau:"), "{case}: no script location in {err}");
     }
 }

@@ -277,11 +277,13 @@ it's drawn at. Drawing more than 8192 device px of one image in one
 direction (say, a 12000 px tall page at full size into a 12000 px canvas)
 is an error that says so; crop it into pieces.
 
-### Effects and `Sdf`
+### Effects, `Sdf` and `Height`
 
 These are elements too: `Halftone { cell = 9, ... children }`,
 `Sdf { range = 50, ... }`. See [effects.md](effects.md) and
-[procedural.md](procedural.md#distance-fields-sdf).
+[procedural.md](procedural.md#distance-fields-sdf). `Height { scale, blur, ... }`
+is a height map that only fills an effect's `"height"` input
+([effects.md](effects.md#height-a-height-map)).
 
 ## Globals available to scripts
 
@@ -298,7 +300,7 @@ These are elements too: `Halftone { cell = 9, ... children }`,
 | `pathBounds(d)` | `{ x, y, w, h }`, the tight bounds of path data (curves included), or `nil` for an empty path |
 | `measure(Text {...})` | Where the text's lines and ink land (below) |
 | `effect { ... }` | Define a shader effect ([effects.md](effects.md)) |
-| `Halftone Duotone Posterize Grain Displace Speckle Rough` | Built-in effects |
+| `Halftone Duotone Posterize Grain Displace Speckle Rough Refract Gloss` | Built-in effects |
 | `require("lib/x")` | Loads `lib/x.luau` relative to the file calling `require`, once per run, and returns its value |
 
 ### `measure`

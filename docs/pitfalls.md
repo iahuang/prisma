@@ -108,6 +108,17 @@ surprised someone.
 - `NAME_march` reads up to `maxd` away. Set `reach` to at least `maxd`, or
   crops won't match full renders. A march that starts within a fraction of a
   pixel of the contour may treat the start as the other side and return ~0.
+- A `Height` is **white = high**. Shapes are filled black by default, which is
+  height 0, so a bump needs `fill = "#fff"` (or a gradient). Its slope comes
+  from an 8-bit render: give it a `blur` of a couple of px, more for gentle
+  ramps, or the surface shows steps.
+- `Refract` and `Gloss` each build the surface from their own `thickness`,
+  `bevel`, `curve`, `body` and `surface`. If a `Gloss` doesn't get the same
+  values, its highlights sit on a different surface. Keep them in one table.
+- `Refract` reads its children where the light bends to, which can be well
+  outside the glass. Past the backdrop (beyond an image's edge, off the
+  canvas) it reads transparency, so the glass shows holes there. Make the
+  backdrop reach past it, or keep the glass away from the edge.
 
 ## Params
 
