@@ -39,5 +39,9 @@ local cases = {
 	transform_and_x = function() return Group { transform = { 1, 0, 0, 1, 0, 0 }, x = 5, shape } end,
 	transform_short = function() return Path { d = "M0,0 L10,10", transform = { 1, 0, 0, 1 } } end,
 	measure_not_text = function() return measure(shape) end,
+	-- transformPath takes a matrix or named placement keys, checked like a Group's
+	transform_path_mixed = function() return Path { d = transformPath("M0,0 L10,10", { 1, 0, 0, 1, 0, 0, x = 5 }) } end,
+	transform_path_key = function() return Path { d = transformPath("M0,0 L10,10", { rotat = 90 }) } end,
+	transform_path_bad_d = function() return Path { d = transformPath("M0,0 Lx", { x = 1 }) } end,
 }
 return Canvas { size = { 200, 100 }, bg = "#fff", cases[param("case")]() }

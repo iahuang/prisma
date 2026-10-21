@@ -55,6 +55,9 @@ surprised someone.
   `(c, d)` are the images of the local x and y axes (SVG order, not row-major).
 - `blur` and effect lengths under an anisotropic `transform` or `scale` use the
   geometric mean of the axes, so a blur stays round in device space.
+- `scale = { 3, 1 }` on a stroked `Path` or `Group` stretches the stroke too
+  (hairlines turn into slabs on one axis). Bake the stretch into the path
+  with `transformPath(d, { scale = { 3, 1 } })` to keep strokes even.
 - Children of a `Group` rotate and scale around the group's `(x, y)`, not
   their own centers. To rotate a shape about its center, put the shape at
   the origin inside a group positioned at the center.
@@ -88,7 +91,8 @@ surprised someone.
   Doing color math on premultiplied values darkens semi-transparent edges.
   Use `unpm` / `pm`.
 - `p` is in absolute device px. Spatial constants written in pixels change
-  with `--scale`, so use `length` uniforms.
+  with `--scale`, so use `length` uniforms, or work in doc px with
+  `to_doc(p)` / `src_doc(q)`.
 - An effect over an `Sdf` reads the field from alpha. Anything opaque under
   the `Sdf` in the same effect corrupts it. An `"sdf"` input slot
   (`body = Sdf { ... }`) avoids this and is exact; prefer it.

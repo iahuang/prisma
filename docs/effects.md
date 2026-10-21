@@ -81,6 +81,12 @@ line numbers inside your `wgsl` string.
 Uniform names must be WGSL identifiers, and can't be `opacity`, `blend`,
 `blur`, `id` or `area`, since every effect already has those props.
 
+**Write geometry in doc px.** To place things at coordinates computed in
+the script (a circle at `cx, cy`, a horizon at `y = 1110`), convert once with
+`let q = to_doc(p);`, do the math in doc px, and read with `src_doc(q)`. Doc
+px here means **canvas** coordinates: an effect inside a translated or
+scaled `Group` doesn't see the group's local space.
+
 **Make anything spatial a `length` uniform.** Lengths are converted to device
 px, so an effect looks the same at `--scale 1` and `--scale 4`. A raw
 constant such as `hash(floor(p / 3.0))` is in device pixels, and its grain
@@ -178,6 +184,8 @@ Bands { area = { 400, 0, 400, 400 }, Sdf { range = 60, blobs } }
 | Helper | |
 | --- | --- |
 | `src(p: vec2f) -> vec4f` | Children at absolute device px, premultiplied |
+| `to_doc(p: vec2f) -> vec2f`, `to_px(q: vec2f) -> vec2f` | Device px ↔ canvas doc px (`p / sys.px_per_unit` and back) |
+| `src_doc(q: vec2f) -> vec4f` | `src` at a canvas doc-px position |
 | `pm(c)`, `unpm(c)` | Premultiply / un-premultiply a `vec4f` |
 | `luma(rgb: vec3f) -> f32` | Rec. 601 luminance |
 | `rot(a: f32) -> mat2x2f` | 2D rotation by `a` radians |

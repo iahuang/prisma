@@ -88,6 +88,9 @@ positioned exactly where that `Text` would render (`y` is the baseline). Use it 
 dashed or gradient-stroked type, or for type as a mask. Concatenated with
 other path data and filled with `fillRule = "evenodd"`, it cuts lettering
 out of a shape ([scripting.md](scripting.md#holes-compound-shapes-and-outlines)).
+To stretch, rotate or fit the outline without scaling its stroke, pass it
+through `transformPath` and measure it with `pathBounds`
+([scripting.md](scripting.md#transforming-path-data-transformpath-pathbounds)).
 
 ## Distance fields: `Sdf`
 

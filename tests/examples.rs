@@ -162,6 +162,19 @@ fn measure_matches_layout() {
 }
 
 #[test]
+fn path_helpers_and_doc_coordinates() {
+    // The fixture asserts transformPath/pathBounds numbers; at --scale 2 its pixels
+    // check a path fitted to a box and an effect that reads src at a doc-px offset.
+    let img = render_script("tests/fixtures/path_helpers.luau", &["--scale", "2"]);
+    let px = |x: u32, y: u32| img.get_pixel(x, y).0;
+    assert_eq!(px(2 * 21, 2 * 21)[..3], [0, 0, 0], "fitted path fills its box's corner");
+    assert_eq!(px(2 * 79, 2 * 59)[..3], [0, 0, 0], "fitted path fills its box's far corner");
+    assert_eq!(px(2 * 82, 2 * 40), [255, 255, 255, 255], "nothing past the box");
+    assert_eq!(px(2 * 140, 2 * 125), [255, 0, 0, 255], "src_doc(to_doc(p) + 20) moves the square 20 doc px left");
+    assert_eq!(px(2 * 160, 2 * 125), [255, 255, 255, 255], "the square's own place is empty");
+}
+
+#[test]
 fn named_effects_can_change_between_runs() {
     // A sweep reuses one engine, like watch mode; each cell redefines "solid" with different code.
     let img = render_script("tests/fixtures/sweep_effect.luau", &["--sweep", "v=0.2,0.8"]);
@@ -367,6 +380,9 @@ fn explicit_rules_reject() {
         ("transform_and_x", &[][..], "give either `transform` or `x`, not both"),
         ("transform_short", &[][..], "expected 6 values { a, b, c, d, e, f }"),
         ("measure_not_text", &[][..], "measure expects a Text { ... } element"),
+        ("transform_path_mixed", &[][..], "transformPath: give a matrix { a, b, c, d, e, f } or named keys"),
+        ("transform_path_key", &[][..], "transformPath: unknown prop `rotat` (did you mean `rotate`?)"),
+        ("transform_path_bad_d", &[][..], "transformPath: bad path data"),
     ] {
         let (_, out) = explicit(case, extra);
         let err = String::from_utf8_lossy(&out.stderr);

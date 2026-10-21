@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use mlua::{Lua, Table, UserData, UserDataFields, UserDataMethods, Value, VmState};
-use vello::kurbo::{Affine, BezPath, Rect};
+use vello::kurbo::{Affine, BezPath, Rect, Shape};
 
 use crate::effects::{EffectDef, InputKind, Margin, UType};
 use crate::engine::{Engine, Raster};
@@ -223,6 +223,51 @@ fn install(lua: &Lua, eng: &Shared, deps: &Deps, opts: &RunOptions) -> Result<()
             };
             let path = eng.fonts.outline(&text).map_err(|err| lua_err(anyhow!("{at}: outline: {err:#}")))?;
             Ok(path.to_svg())
+        })?,
+    )?;
+
+    // transformPath(d, t): path data moved through a placement, as absolute path data.
+    // `t` is a matrix { a, b, c, d, e, f } or the keys a Group takes: x y rotate scale, or transform.
+    g.set(
+        "transformPath",
+        lua.create_function(|lua, (d, t): (String, Value)| {
+            let at = caller(lua);
+            let fail = |err: anyhow::Error| lua_err(anyhow!("{at}: transformPath: {err:#}"));
+            let path = BezPath::from_svg(&d).map_err(|err| fail(anyhow!("bad path data: {err}")))?;
+            let Value::Table(t) = t else {
+                return Err(fail(anyhow!("expected a matrix {{ a, b, c, d, e, f }} or {{ x, y, rotate, scale }}, got {}", type_name(&t))));
+            };
+            let m = if t.raw_len() > 0 {
+                if t.pairs::<Value, Value>().any(|kv| kv.is_ok_and(|(k, _)| k.is_string())) {
+                    return Err(fail(anyhow!("give a matrix {{ a, b, c, d, e, f }} or named keys {{ x, y, rotate, scale }}, not both")));
+                }
+                let p = Props { t: lua.create_table_from([("transform", t)])?, op: "transformPath".into(), at: at.clone(), known: RefCell::default() };
+                placement(&p).map_err(lua_err)?
+            } else {
+                let p = Props { t, op: "transformPath".into(), at: at.clone(), known: RefCell::default() };
+                let m = placement(&p).map_err(lua_err)?;
+                p.finish().map_err(lua_err)?;
+                m
+            };
+            Ok((Affine::new(m) * path).to_svg())
+        })?,
+    )?;
+
+    // pathBounds(d) -> { x, y, w, h }: the tight bounds of path data, or nil when it's empty.
+    g.set(
+        "pathBounds",
+        lua.create_function(|lua, d: String| {
+            let path = BezPath::from_svg(&d).map_err(|err| lua_err(anyhow!("{}: pathBounds: bad path data: {err}", caller(lua))))?;
+            if path.elements().is_empty() {
+                return Ok(Value::Nil);
+            }
+            let r = path.bounding_box();
+            let t = lua.create_table()?;
+            t.raw_set("x", r.x0)?;
+            t.raw_set("y", r.y0)?;
+            t.raw_set("w", r.width())?;
+            t.raw_set("h", r.height())?;
+            Ok(Value::Table(t))
         })?,
     )?;
 

@@ -141,6 +141,33 @@ Path { d = mark, x = 570, y = 180, fill = "none", stroke = "#e63946" }       -- 
 the same way. The path data is a plain string, so a script can build, reuse
 and transform it like any other value.
 
+#### Transforming path data: `transformPath`, `pathBounds`
+
+`transformPath(d, t)` bakes a transform into the path data itself. Unlike
+`scale` on a `Path` or `Group`, which also stretches the stroke, a stroke
+drawn on the result stays the width you give it. Use it to stretch type or
+a mark non-uniformly and then outline it, or to combine transformed pieces
+into one `d` for `evenodd`.
+
+```lua
+transformPath(d, { x = 40, y = 10, rotate = 15, scale = { 3, 1 } })  -- translate · rotate · scale, as on Group
+transformPath(d, { 3, 0, 0, 1, 40, 10 })                              -- an SVG matrix, as `transform`
+```
+
+The result is absolute (`M L Q C Z`): relative commands and `H`/`V` are
+resolved and arcs become cubics. A table with both matrix entries and
+named keys, an unknown key, or bad path data is an error.
+
+`pathBounds(d)` pairs with it. To stretch glyphs into a box:
+
+```lua
+local d = outline(Text { font = "Didot", weight = 700, size = 100, "M" })
+local b = pathBounds(d)
+local sx, sy = w / b.w, h / b.h
+Path { d = transformPath(d, { sx, 0, 0, sy, x - b.x * sx, y - b.y * sy }),
+	fill = "none", stroke = "#000", strokeWidth = 1.2 }   -- the hairline stays 1.2 px
+```
+
 ### `Group`
 
 | Prop | Default | Notes |
@@ -266,6 +293,8 @@ These are elements too: `Halftone { cell = 9, ... children }`,
 | `linear`, `radial` | Gradients (above) |
 | `grid`, `hexGrid`, `sample`, `rasterize` | [procedural.md](procedural.md) |
 | `outline(Text {...})` | Glyph outlines as SVG path data for a `Path`: stroke it with `fill = "none"`, mask with it, or join it to a mark ([procedural.md](procedural.md#type-as-geometry-outline)) |
+| `transformPath(d, t)` | Path data moved through a placement, returned as absolute path data. `t` is a matrix `{ a, b, c, d, e, f }` or the keys a `Group` takes (`x y rotate scale`, or `transform`). See [Transforming path data](#transforming-path-data-transformpath-pathbounds) |
+| `pathBounds(d)` | `{ x, y, w, h }`, the tight bounds of path data (curves included), or `nil` for an empty path |
 | `measure(Text {...})` | Where the text's lines and ink land (below) |
 | `effect { ... }` | Define a shader effect ([effects.md](effects.md)) |
 | `Halftone Duotone Posterize Grain Displace Speckle Rough` | Built-in effects |

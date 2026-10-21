@@ -66,7 +66,7 @@ impl InputKind {
 }
 
 /// Names the prelude defines, which inputs can't take.
-const RESERVED: &[&str] = &["src", "pm", "unpm", "luma", "rot", "sdf_dist", "hash", "hash3", "vnoise", "fbm", "effect", "sys", "u"];
+const RESERVED: &[&str] = &["src", "src_doc", "to_doc", "to_px", "pm", "unpm", "luma", "rot", "sdf_dist", "hash", "hash3", "vnoise", "fbm", "effect", "sys", "u"];
 
 /// An effect's `reach` or `grow`: a fixed length or a length uniform's value.
 #[derive(Clone, Debug)]
@@ -333,6 +333,12 @@ fn src(p: vec2f) -> vec4f {
   let b = mix(prisma_texel(i + vec2i(0, 1)), prisma_texel(i + vec2i(1, 1)), f.x);
   return mix(a, b, f.y);
 }
+
+// Canvas doc px <-> device px. p is device px; geometry written in the script is doc px.
+fn to_doc(p: vec2f) -> vec2f { return p / sys.px_per_unit; }
+fn to_px(q: vec2f) -> vec2f { return q * sys.px_per_unit; }
+// The rendered children at canvas doc position q.
+fn src_doc(q: vec2f) -> vec4f { return src(q * sys.px_per_unit); }
 
 fn pm(c: vec4f) -> vec4f { return vec4f(c.rgb * c.a, c.a); }
 fn unpm(c: vec4f) -> vec4f { if (c.a > 1e-4) { return vec4f(c.rgb / c.a, c.a); } return vec4f(0.0); }
