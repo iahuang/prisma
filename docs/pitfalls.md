@@ -1,0 +1,98 @@
+# Pitfalls
+
+These come from reading the source and probing the CLI. Each one has
+surprised someone.
+
+## Text
+
+- `y` is the first line's **baseline**. Descenders hang below it, and a
+  line's top sits about 0.7 × size above it for caps.
+- **`align` needs a box, `anchor` places a line.** With `w`, `align` places
+  lines inside `[x, x + w]`. Without `w`, use `anchor = "end", x = 760` to
+  make the line *end* at 760. Using either one in the other's case is an error.
+- **`tracking` is in em**, so `tracking = 2` means 2 × size. Typical values
+  are −0.05 to 0.2.
+- `Text` has no `stroke`. Use `Path { d = outline(Text {...}), stroke = ... }`.
+- `font` is a **family** name only. `"Courier New Bold"` is an error that
+  tells you to write `font = "Courier New", weight = 700`. Font files go in
+  `fontFile`. Font names fail loudly, and there's no silent fallback.
+
+## Paint and shapes
+
+- **Shapes are filled black unless you say `fill = "none"`**, even when they
+  have a `stroke`. An outline-only shape needs `fill = "none"`. (`Line` is
+  never filled, and giving it a `fill` is an error.)
+- `opacity` fades the element as a whole. A shape with both fill and stroke
+  at `opacity = 0.5` shows its stroke at half strength over the background,
+  not over its own fill. Out-of-range `opacity` (or negative `blur`) is an
+  error, not clamped.
+- The default `join` is `round`, not `miter`.
+- Gradient coordinates are absolute in the shape's coordinate space. To make
+  a gradient follow a shape, compute its endpoints from the same numbers as
+  the shape, or wrap the shape in a `Group { x, y }` and draw both at the
+  origin.
+- The only color keywords are `none transparent black white`. `"red"` is an
+  error.
+- `rgba()` alpha is 0–1, while its r, g and b are 0–255.
+
+## Groups, masks, opacity, blend
+
+- `blend` composites against what's already drawn **inside the same parent**.
+  A `Group` with `opacity < 1` or a non-normal blend is a separate layer, so
+  children blending inside it don't see what's under the group.
+- `Group.clip` uses the group's local coordinates, and the clip is
+  transformed with the group.
+- Children of a `Group` rotate and scale around the group's `(x, y)`, not
+  their own centers. To rotate a shape about its center, put the shape at
+  the origin inside a group positioned at the center.
+
+## Effects
+
+- **By default an effect only draws over its children's bounds (plus
+  `grow`).** For a full-canvas effect, set `area = { 0, 0, W, H }`.
+- If an effect reads `src` at an offset (displace, scatter, blur-like), set
+  `reach`; otherwise its edges read transparency. If it also moves or
+  spreads ink past its children, set `grow` too. `pad` is gone: `pad = x`
+  was `reach = x, grow = x`.
+- `src()`, color uniforms and the return value are all **premultiplied**.
+  Doing color math on premultiplied values darkens semi-transparent edges.
+  Use `unpm` / `pm`.
+- `p` is in absolute device px. Spatial constants written in pixels change
+  with `--scale`, so use `length` uniforms.
+- An effect over an `Sdf` reads the field from alpha. Anything opaque under
+  the `Sdf` in the same effect corrupts it. An `"sdf"` input slot
+  (`body = Sdf { ... }`) avoids this and is exact; prefer it.
+- An input slot takes exactly its element: `body = Sdf { range = 40, shape }`,
+  never a bare `shape`. Prisma doesn't wrap it for you.
+- `NAME_march` reads up to `maxd` away. Set `reach` to at least `maxd`, or
+  crops won't match full renders. A march that starts within a fraction of a
+  pixel of the contour may treat the start as the other side and return ~0.
+
+## Params
+
+- `params.k` is always the **string** typed after `-p k=`. Use
+  `param("k", default)` to get it as the default's type. It errors on
+  `-p cell=abc` when the default is a number. Arithmetic on a raw
+  `params.cell` relies on Luau's own string coercion, so don't.
+
+## Files and paths
+
+- Relative paths resolve from the entry script's directory, even inside a
+  `require`d module (not from the module's own directory). A path that leaves `--root` (default: the script's
+  directory) is an error, so pass `--root ..` to reach `"../photo.jpg"`.
+- Image natural size is 1 image px = 1 doc px. A 4000 px photo dropped in
+  without `w`/`h` covers a 600 px poster many times over.
+- A `rasterize` result is cached on disk by content and by the mtimes of
+  files it reads. If you change something it can't see (only possible when
+  developing prisma itself), use `--no-cache` or bump `CACHE_VERSION`.
+
+## Script structure
+
+- `Canvas` must be the returned root. To nest one, `rasterize` it and draw
+  the raster with `Image`.
+- Strings directly in children are an error (`stray text "..."`). Wrap them
+  in `Text`.
+- A typo'd prop is an error with a suggestion, never a silent no-op. Read
+  the message.
+- The script has no `io` or `os`. Compute everything in Lua, or pass values
+  in with `-p`.

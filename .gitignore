@@ -1,0 +1,9 @@
+target/
+.prisma-cache/
+out/
+*.png
+!examples/assets/*.png
+!assets/*.png
+.DS_Store
+benchmarks/
+.claude/skills/benchmark/
