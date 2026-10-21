@@ -20,6 +20,7 @@
 | `src/gpu.rs` | wgpu device, vello renderer, the fixed pipelines (separable blur, down/up sampling, mask, jump-flood SDF), effect pipeline cache, readback, overflow checks (`Overflow`, `BumpCheck`, `Gpu::check`) |
 | `vendor/vello/` | vello 0.11 with one addition, `render_to_texture_with_bump`, so overflow can be detected (`vendor/vello/PRISMA.md`) |
 | `src/effects.rs` | `EffectDef`: uniform types, packing (colors first, then f32s), `reach`/`grow`, the WGSL prelude (`src`, `pm`, `hash`, `fbm`, ...), naga validation |
+| `src/warp.rs` | Shape warps: `Patch` (Coons, bicubic, along-path; `Edge` = arc-length-parameterised curve that extends past its ends), the `Map` trait (patch over a `from` rect, or a Lua function in `script.rs`), and `warp_path`, which emits cubic Hermite pieces split until within tolerance of the mapped curve. `Warp` resolves in `Conv::warp_node` into plain `Path` shapes, so the IR and `render.rs` never see a warp. |
 | `src/text.rs` | Font resolution (an exact system family or a font file; face words only feed the not-found hint), parley layout, skrifa glyph outlines |
 | `src/engine.rs` | State that outlives a run: GPU, fonts, decoded images, rasters, the effect registry (cleared at the start of each run); path resolution (`resolve`: relative to `script_dir`, confined to `base_dir` = `--root`; `script.rs` first rewrites a path as written in a module to one from `script_dir`, via the chunk name); `rasterize` memoization (memory + `.prisma-cache/`) |
 | `tests/examples.rs` | Renders every example through the binary and checks pixels |
@@ -103,6 +104,12 @@
 - **vello image ids**: each scene re-ids the images it draws (`Pass::fresh`),
   because vello's atlas can serve stale pixels across renders when ids are
   reused.
+- **Warps resolve during conversion.** `Conv::warp_node` turns a `Warp`'s
+  subtree into plain `Path` shapes, so there's no warp in the IR. That needs
+  text outlines while the engine is only borrowed, which is why
+  `Engine::fonts` is a `RefCell` (render takes `get_mut`). A Lua map
+  function runs while that borrow is held, so `rasterize` and `effect` use
+  `try_borrow_mut` and refuse to run inside one.
 - **Errors carry script locations.** Constructors record `_at` ("file:line").
   `Props::err` prefixes it, and render errors are wrapped with `Node::at`.
   Keep new errors in the form `file.luau:LINE: Element: what's wrong (how to
@@ -135,7 +142,9 @@ cargo test --release
 ```
 
 - Unit tests: units parsing, `through` (spline passes through its points),
-  and effect compilation (including correct user line numbers in errors).
+  effect compilation (including correct user line numbers in errors), and
+  warps (`warp.rs`: a Coons patch of a rect is the identity, outline corners,
+  the `from` check, `along` offsets).
 - `tests/examples.rs` runs the real binary on the GPU with `--no-cache`. It
   checks that every example renders (`all_examples_render`), samples exact
   pixels (`basics_pixels`, `sdf_pixels` at scales 1 and 2), measures `"sdf"`
@@ -151,7 +160,10 @@ cargo test --release
   and outlines are checked in `logo_pixels`. vello buffer overflow (bounded mask layers, a
   split render matching a crop, the line-segment error) is checked against
   `tests/fixtures/overflow.luau`, and images and passes over the atlas limit
-  against `tests/fixtures/big.luau`.
+  against `tests/fixtures/big.luau`. Affine warps (a Coons patch from an
+  outline and from edges, a function) must draw what a `Group` transform does
+  (`affine_warps_match_transforms`), and warp errors are checked in
+  `warp_rules_reject`, both against `tests/fixtures/warp.luau`.
 - **For a new feature, add an example to `examples/` and add it to the list
   in `all_examples_render`.** Then add a pixel test that checks the feature's
   actual math at known coordinates, and a crop check if the feature is

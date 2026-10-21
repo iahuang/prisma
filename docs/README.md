@@ -13,6 +13,7 @@ reading the Rust.
 | Write or fix a design script | [scripting.md](scripting.md): elements, props, defaults, units |
 | Build a logo or mark: holes, compound shapes, outline-only views | [scripting.md](scripting.md#holes-compound-shapes-and-outlines): one `Path`, `fillRule = "evenodd"`, `fill = "none"` |
 | Write a pixel shader effect | [effects.md](effects.md): `effect { ... }`, WGSL helpers, built-in effects |
+| Bend content into a shape: type on a path, patterns in a silhouette | [scripting.md](scripting.md#warp): `Warp`, `edgePatch`, `along`, `bezierPatch`, `warpPath` |
 | Drive shapes from pixels (halftones, sampling, type as paths, distance fields) | [procedural.md](procedural.md): `rasterize`, `sample`, grids, `outline`, `Sdf`, randomness |
 | Render, iterate, debug a render | [cli.md](cli.md): flags and the debugging loop |
 | Avoid the known traps | [pitfalls.md](pitfalls.md) |
@@ -56,4 +57,5 @@ that a design looks right. Only the render can tell you.
 | `examples/type.luau` | Baseline-aligned type at mixed sizes, a gradient through text, a full-bleed effect via `area` |
 | `examples/transform.luau` | `measure()`-driven layout (chained breadcrumb, pills fit to labels) placed with a sheared `transform` |
 | `examples/logo.luau` | A mark as one `Path` with `fillRule = "evenodd"` (holes without masks), and its construction drawn from the same path as outlines |
+| `examples/warp.luau` | `Warp` through each kind of map: a Coons ribbon, type `along` a circle (fit with `measure`), a `bezierPatch` flag with `strokes = "warp"`, a function |
 | `examples/refract.luau` | Glass from parts: `Refract` and `Gloss` composed into a lens, water (a `Height` input drawn with noise) and bubbles in frosted glass |

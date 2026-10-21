@@ -244,7 +244,7 @@ fn brush(p: &Paint, alpha: f32) -> Brush {
     if alpha < 1.0 { b.multiply_alpha(alpha) } else { b }
 }
 
-fn kurbo_stroke(s: &Stroke) -> kurbo::Stroke {
+pub fn kurbo_stroke(s: &Stroke) -> kurbo::Stroke {
     let cap = match s.cap {
         Cap::Butt => kurbo::Cap::Butt,
         Cap::Round => kurbo::Cap::Round,
@@ -656,11 +656,11 @@ impl<'a> Pass<'a> {
                 }
             }
             Kind::Text(t) if self.fine => {
-                let path = self.eng.fonts.outline(t)?;
+                let path = self.eng.fonts.get_mut().outline(t)?;
                 scene.fill(Fill::NonZero, xf, &brush(&t.fill, alpha), None, &flattened(&path, FIELD_TOLERANCE / scale_of(xf)));
             }
             Kind::Text(t) => {
-                let layout = self.eng.fonts.layout(t)?;
+                let layout = self.eng.fonts.get_mut().layout(t)?;
                 // Offset the glyphs rather than the transform, so gradients stay in the
                 // same coordinates as every other paint.
                 let (ox, oy) = Fonts::origin(t, &layout);
@@ -770,7 +770,7 @@ impl<'a> Pass<'a> {
                 Some(r.inflate(grow + 1.0, grow + 1.0))
             }
             Kind::Text(t) => {
-                let layout = self.eng.fonts.layout(t).map_err(|e| if n.at.is_empty() { e } else { anyhow!("{}: Text: {e:#}", n.at) })?;
+                let layout = self.eng.fonts.get_mut().layout(t).map_err(|e| if n.at.is_empty() { e } else { anyhow!("{}: Text: {e:#}", n.at) })?;
                 Some((xf * Fonts::bounds(t, &layout).to_path(0.1)).bounding_box())
             }
             Kind::Image { dst: [x, y, w, h], .. } => Some((xf * Rect::new(*x, *y, x + w, y + h).to_path(0.1)).bounding_box()),

@@ -17,17 +17,18 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use mlua::{Lua, Table, UserData, UserDataFields, UserDataMethods, Value, VmState};
-use vello::kurbo::{Affine, BezPath, Rect, Shape};
+use mlua::{Function, Lua, Table, UserData, UserDataFields, UserDataMethods, Value, VmState};
+use vello::kurbo::{self, Affine, BezPath, Point, Rect, Shape, Vec2};
 
 use crate::effects::{EffectDef, InputDef, InputKind, Margin, UType};
 use crate::engine::{Engine, Raster};
 use crate::ir::{Align, Anchor, Blend, Cap, Document, Fit, Font, Geom, ImageSrc, Join, Kind, Node, Paint, Stroke, Text, UValue};
 use crate::units::{Rgba, parse_color, parse_length};
+use crate::warp::{Edge, Map, Patch, PatchMap, warp_path};
 
 const PRELUDE: &str = include_str!("prelude.luau");
 
-const PRIMITIVES: &[&str] = &["Canvas", "Group", "Mask", "Rect", "Circle", "Ellipse", "Line", "Path", "Text", "Image", "Sdf", "Height"];
+const PRIMITIVES: &[&str] = &["Canvas", "Group", "Mask", "Rect", "Circle", "Ellipse", "Line", "Path", "Text", "Image", "Sdf", "Height", "Warp"];
 
 pub struct RunOptions {
     pub seed: u64,
@@ -172,7 +173,11 @@ fn install(lua: &Lua, eng: &Shared, deps: &Deps, opts: &RunOptions) -> Result<()
             let at = caller(lua);
             let def = parse_effect(&t).map_err(|err| lua_err(anyhow!("{at}: {err:#}")))?;
             let name = def.name.clone();
-            e.borrow_mut().effects.define(def).map_err(lua_err)?;
+            e.try_borrow_mut()
+                .map_err(|_| lua_err(anyhow!("{at}: effect: can't be defined inside a Warp map function")))?
+                .effects
+                .define(def)
+                .map_err(lua_err)?;
             lua.create_function(move |lua, t: Table| {
                 t.raw_set("_op", "Effect")?;
                 t.raw_set("_effect", name.as_str())?;
@@ -206,7 +211,7 @@ fn install(lua: &Lua, eng: &Shared, deps: &Deps, opts: &RunOptions) -> Result<()
                 conv.nodes(scene, &mut children).map_err(wrap)?;
                 Document { size, bg, margin, children }
             };
-            let mut eng = e.borrow_mut();
+            let mut eng = e.try_borrow_mut().map_err(|_| wrap(anyhow!("can't run inside a Warp map function")))?;
             let r = eng.rasterize(&doc, dpi).map_err(wrap)?;
             if let (Some(name), Some(dir)) = (name, &eng.dump_dir) {
                 crate::engine::write_png(&dir.join(format!("{name}.png")), r.width, r.height, r.pixels.clone()).map_err(wrap)?;
@@ -220,12 +225,12 @@ fn install(lua: &Lua, eng: &Shared, deps: &Deps, opts: &RunOptions) -> Result<()
         "outline",
         lua.create_function(move |lua, t: Table| {
             let at = caller(lua);
-            let mut eng = e.borrow_mut();
+            let eng = e.borrow();
             let node = Conv { eng: &eng, deps: &d }.node(t).map_err(lua_err)?;
             let Kind::Text(text) = node.kind else {
                 return Err(lua_err(anyhow!("{at}: outline expects a Text {{ ... }} element")));
             };
-            let path = eng.fonts.outline(&text).map_err(|err| lua_err(anyhow!("{at}: outline: {err:#}")))?;
+            let path = eng.fonts.borrow_mut().outline(&text).map_err(|err| lua_err(anyhow!("{at}: outline: {err:#}")))?;
             Ok(path.to_svg())
         })?,
     )?;
@@ -280,12 +285,12 @@ fn install(lua: &Lua, eng: &Shared, deps: &Deps, opts: &RunOptions) -> Result<()
         "measure",
         lua.create_function(move |lua, t: Table| {
             let at = caller(lua);
-            let mut eng = e.borrow_mut();
+            let eng = e.borrow();
             let node = Conv { eng: &eng, deps: &d }.node(t).map_err(lua_err)?;
             let Kind::Text(text) = node.kind else {
                 return Err(lua_err(anyhow!("{at}: measure expects a Text {{ ... }} element")));
             };
-            let m = eng.fonts.measure(&text).map_err(|err| lua_err(anyhow!("{at}: measure: {err:#}")))?;
+            let m = eng.fonts.borrow_mut().measure(&text).map_err(|err| lua_err(anyhow!("{at}: measure: {err:#}")))?;
             let rect = |r: Rect| -> mlua::Result<Table> {
                 let t = lua.create_table()?;
                 t.raw_set("x", r.x0)?;
@@ -314,6 +319,8 @@ fn install(lua: &Lua, eng: &Shared, deps: &Deps, opts: &RunOptions) -> Result<()
         })?,
     )?;
 
+    install_warp(lua)?;
+
     // require("lib/brushes") loads lib/brushes.luau next to the requiring file, once.
     let (e, d) = (eng.clone(), deps.clone());
     let loaded: Rc<RefCell<HashMap<PathBuf, mlua::RegistryKey>>> = Rc::default();
@@ -336,6 +343,226 @@ fn install(lua: &Lua, eng: &Shared, deps: &Deps, opts: &RunOptions) -> Result<()
         })?,
     )?;
     Ok(())
+}
+
+/// A warp patch as scripts see it: `edgePatch {...}`, `bezierPatch {...}`, `along(d, {...})`.
+#[derive(Clone)]
+pub struct PatchUd(pub Rc<Patch>);
+
+impl UserData for PatchUd {
+    fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
+        // patch:at(u, v) -> x, y
+        m.add_method("at", |_, this, (u, v): (f64, f64)| {
+            let p = this.0.at(u, v);
+            Ok((p.x, p.y))
+        });
+        // patch:frame(u, v) -> { x, y, ux, uy, vx, vy }: the point and its partial derivatives
+        m.add_method("frame", |lua, this, (u, v): (f64, f64)| {
+            let (p, du, dv) = this.0.frame(u, v);
+            let t = lua.create_table()?;
+            for (k, x) in [("x", p.x), ("y", p.y), ("ux", du.x), ("uy", du.y), ("vx", dv.x), ("vy", dv.y)] {
+                t.raw_set(k, x)?;
+            }
+            Ok(t)
+        });
+    }
+}
+
+/// Where a warp's map comes from: a patch over the unit square, or a Lua function over doc px.
+enum MapSrc {
+    Patch(Rc<Patch>),
+    Func(Function),
+}
+
+fn map_src(v: &Value) -> Result<MapSrc> {
+    match v {
+        Value::UserData(ud) => match ud.borrow::<PatchUd>() {
+            Ok(p) => Ok(MapSrc::Patch(p.0.clone())),
+            Err(_) => bail!("expected a patch (edgePatch {{...}}, bezierPatch {{...}}, along(...)) or a function(x, y) returning x, y"),
+        },
+        Value::Function(f) => Ok(MapSrc::Func(f.clone())),
+        _ => bail!("expected a patch (edgePatch {{...}}, bezierPatch {{...}}, along(...)) or a function(x, y) returning x, y, got {}", type_name(v)),
+    }
+}
+
+/// A Lua function `(x, y) -> x, y` as a map.
+struct LuaMap(Function);
+
+impl LuaMap {
+    fn call(&self, p: Point) -> Result<Point> {
+        let (x, y): (Value, Value) = self.0.call((p.x, p.y)).map_err(|e| anyhow!("the map function failed: {e}"))?;
+        match (number(&x), number(&y)) {
+            (Ok(x), Ok(y)) if x.is_finite() && y.is_finite() => Ok(Point::new(x, y)),
+            _ => bail!("the map function must return two finite numbers (x, y), got {} and {}", type_name(&x), type_name(&y)),
+        }
+    }
+}
+
+impl Map for LuaMap {
+    fn at(&mut self, p: Point) -> Result<Point> {
+        self.call(p)
+    }
+    fn deriv(&mut self, p: Point, d: Vec2) -> Result<Vec2> {
+        let len = d.hypot();
+        if len == 0.0 {
+            return Ok(Vec2::ZERO);
+        }
+        const H: f64 = 1e-3;
+        let n = d / len;
+        Ok((self.call(p + n * H)? - self.call(p - n * H)?) * (len / (2.0 * H)))
+    }
+}
+
+/// Builds the map a warp uses. A patch needs `from`; a function maps doc px itself and takes none.
+fn make_map<'a>(src: &'a MapSrc, from: Option<[f64; 4]>, extend: bool) -> Result<Box<dyn Map + 'a>> {
+    match (src, from) {
+        (MapSrc::Patch(patch), Some(from)) => {
+            if from[2] == 0.0 || from[3] == 0.0 {
+                bail!("`from` needs a nonzero width and height, got {{ {}, {}, {}, {} }}", from[0], from[1], from[2], from[3]);
+            }
+            Ok(Box::new(PatchMap { patch, from, extend, lenient: false }))
+        }
+        (MapSrc::Patch(_), None) => bail!("missing `from = {{ x, y, w, h }}`: the rect that maps onto the patch"),
+        (MapSrc::Func(f), None) => {
+            if extend {
+                bail!("`outside` applies to patches; a map function is defined everywhere");
+            }
+            Ok(Box::new(LuaMap(f.clone())))
+        }
+        (MapSrc::Func(_), Some(_)) => bail!("a map function maps doc px directly, so it takes no `from`"),
+    }
+}
+
+/// An edge or outline: path data, or a list of {x, y} points joined by straight lines.
+fn curve_path(v: &Value) -> Result<BezPath> {
+    match v {
+        Value::String(s) => BezPath::from_svg(&s.to_str()?).map_err(|e| anyhow!("bad path data: {e}")),
+        Value::Table(t) => {
+            let pts: Vec<[f64; 2]> = t.sequence_values::<Value>().map(|q| point(&q?)).collect::<Result<_>>()?;
+            if pts.len() < 2 {
+                bail!("needs at least 2 points");
+            }
+            Ok(through(&pts, false, false))
+        }
+        _ => bail!("expected path data or a list of {{x, y}} points, got {}", type_name(v)),
+    }
+}
+
+fn install_warp(lua: &Lua) -> Result<()> {
+    let g = lua.globals();
+    let props = |lua: &Lua, t: Table, op: &str| Props { t, op: op.into(), at: caller(lua), known: RefCell::default() };
+    let param = |p: &Props| p.choice("param", &[("arclength", true), ("uniform", false)], true);
+
+    // edgePatch { top, right, bottom, left } or edgePatch { outline, corners = { tl, tr, br, bl } }
+    g.set(
+        "edgePatch",
+        lua.create_function(move |lua, t: Table| {
+            let p = props(lua, t, "edgePatch");
+            let build = || -> Result<Patch> {
+                let arclength = param(&p)?;
+                let outline = p.with("outline", curve_path)?;
+                let corners = p.with("corners", |v| {
+                    let Value::Table(t) = v else { bail!("expected {{ tl, tr, br, bl }}, four {{x, y}} points") };
+                    let pts: Vec<[f64; 2]> = t.sequence_values::<Value>().map(|q| point(&q?)).collect::<Result<_>>()?;
+                    let [a, b, c, d] = pts[..] else { bail!("expected four corners {{ tl, tr, br, bl }}, got {}", pts.len()) };
+                    Ok([a, b, c, d].map(|q| Point::new(q[0], q[1])))
+                })?;
+                let edges = ["top", "right", "bottom", "left"].map(|k| p.with(k, curve_path));
+                let [top, right, bottom, left] = edges;
+                let (top, right, bottom, left) = (top?, right?, bottom?, left?);
+                let any_edge = top.is_some() || right.is_some() || bottom.is_some() || left.is_some();
+                let patch = match (outline, corners) {
+                    (Some(_), _) if any_edge => return Err(p.err("give either `outline` + `corners` or the four edges, not both")),
+                    (Some(o), Some(c)) => Patch::coons_outline(&o, c, arclength).map_err(|e| p.err(e))?,
+                    (Some(_), None) => return Err(p.err("`outline` needs `corners = { tl, tr, br, bl }`: where to cut it into four edges")),
+                    (None, Some(_)) => return Err(p.err("`corners` cut an `outline`; give one")),
+                    (None, None) => {
+                        let need = |e: Option<BezPath>, k: &str| e.ok_or_else(|| p.err(format!("missing `{k}` (give top, right, bottom, left, or outline + corners)")));
+                        let edge = |e: BezPath, k: &str| Edge::from_path(&e, arclength, k).map_err(|e| p.err(e));
+                        Patch::coons(
+                            edge(need(top, "top")?, "top")?,
+                            edge(need(right, "right")?, "right")?,
+                            edge(need(bottom, "bottom")?, "bottom")?,
+                            edge(need(left, "left")?, "left")?,
+                        )
+                        .map_err(|e| p.err(format!("{e:#} (edges run top: TL->TR, right: TR->BR, bottom: BL->BR, left: TL->BL)")))?
+                    }
+                };
+                p.finish()?;
+                Ok(patch)
+            };
+            build().map(|patch| PatchUd(Rc::new(patch))).map_err(lua_err)
+        })?,
+    )?;
+
+    // bezierPatch { 16 points }: rows top to bottom, each left to right
+    g.set(
+        "bezierPatch",
+        lua.create_function(move |lua, t: Table| {
+            let at = caller(lua);
+            let pts: Vec<[f64; 2]> = t
+                .sequence_values::<Value>()
+                .map(|q| point(&q?))
+                .collect::<Result<_>>()
+                .map_err(|e| lua_err(anyhow!("{at}: bezierPatch: {e:#}")))?;
+            if pts.len() != 16 {
+                return Err(lua_err(anyhow!("{at}: bezierPatch: expected 16 control points (4 rows of 4, top row first), got {}", pts.len())));
+            }
+            let mut p = [[Point::ZERO; 4]; 4];
+            for (k, q) in pts.iter().enumerate() {
+                p[k / 4][k % 4] = Point::new(q[0], q[1]);
+            }
+            Ok(PatchUd(Rc::new(Patch::Bezier { p })))
+        })?,
+    )?;
+
+    // along(d, { width }): u runs along the path, v across a band `width` wide (v = 0 on the left of travel)
+    g.set(
+        "along",
+        lua.create_function(move |lua, (d, t): (Value, Table)| {
+            let p = props(lua, t, "along");
+            let build = || -> Result<Patch> {
+                let path = curve_path(&d).map_err(|e| p.err(e))?;
+                let width = p.req_len("width")?;
+                if width <= 0.0 {
+                    return Err(p.err(format!("`width` must be positive, got {width}")));
+                }
+                let arclength = param(&p)?;
+                p.finish()?;
+                Ok(Patch::Along { path: Edge::from_path(&path, arclength, "path").map_err(|e| p.err(e))?, width })
+            };
+            build().map(|patch| PatchUd(Rc::new(patch))).map_err(lua_err)
+        })?,
+    )?;
+
+    // warpPath(d, map, { from, outside, tolerance }) -> path data
+    g.set(
+        "warpPath",
+        lua.create_function(move |lua, (d, map, opts): (String, Value, Option<Table>)| {
+            let p = props(lua, opts.map_or_else(|| lua.create_table(), Ok)?, "warpPath");
+            let run = || -> Result<String> {
+                let path = BezPath::from_svg(&d).map_err(|e| p.err(format!("bad path data: {e}")))?;
+                let src = map_src(&map).map_err(|e| p.err(format!("map: {e:#}")))?;
+                let (from, extend, tol) = warp_opts(&p)?;
+                p.finish()?;
+                let mut m = make_map(&src, from, extend).map_err(|e| p.err(e))?;
+                Ok(warp_path(&path, m.as_mut(), tol).map_err(|e| p.err(e))?.to_svg())
+            };
+            run().map_err(lua_err)
+        })?,
+    )?;
+    Ok(())
+}
+
+/// `from`, `outside` and `tolerance`, shared by `Warp` and `warpPath`.
+fn warp_opts(p: &Props) -> Result<(Option<[f64; 4]>, bool, f64)> {
+    let from = p.with("from", rect4)?;
+    let extend = p.choice("outside", &[("error", false), ("extend", true)], false)?;
+    let tol = p.len_or("tolerance", 0.05)?;
+    if tol <= 0.0 {
+        return Err(p.err(format!("`tolerance` must be positive, got {tol}")));
+    }
+    Ok((from, extend, tol))
 }
 
 /// A raster as scripts see it.
@@ -723,6 +950,22 @@ fn through(pts: &[[f64; 2]], closed: bool, smooth: bool) -> BezPath {
     path
 }
 
+/// The state a Warp's walk carries: its map, tolerance, and stroke mode.
+struct WarpCx<'a> {
+    map: Box<dyn Map + 'a>,
+    tol: f64,
+    /// Strokes drawn after the warp (constant width) rather than warped as outlines.
+    after: bool,
+}
+
+/// Warped geometry can't carry gradients: vello maps paint through affines only.
+fn solid(p: &Paint) -> Result<()> {
+    match p {
+        Paint::Solid { .. } => Ok(()),
+        _ => bail!("gradient paint can't follow a warp (paint transforms are affine); fill the warped shape solid and use it as a Mask over the gradient"),
+    }
+}
+
 struct Conv<'a> {
     eng: &'a Engine,
     deps: &'a Deps,
@@ -855,6 +1098,75 @@ impl Conv<'_> {
         let children = self.child_nodes(&p)?;
         p.finish()?;
         Ok(Node { kind: Kind::Height { scale, children }, opacity, blend, blur, at })
+    }
+
+    /// Rewrites a converted node so its geometry follows the warp. `acc` takes
+    /// the node's local coordinates to the Warp's; transforms stay on their
+    /// Groups, and each path is warped in the Warp's space and brought back.
+    fn warp_node(&self, n: Node, acc: Affine, cx: &mut WarpCx) -> Result<Node> {
+        let Node { kind, opacity, blend, blur, at } = n;
+        let fail = |what: &str, e: anyhow::Error| anyhow!("{at}: {what} in a Warp: {e:#}");
+        let kids = |cs: Vec<Node>, acc: Affine, cx: &mut WarpCx| cs.into_iter().map(|c| self.warp_node(c, acc, cx)).collect::<Result<Vec<_>>>();
+        let kind = match kind {
+            Kind::Group { transform, clip, children } => {
+                if clip.is_some() {
+                    bail!("{at}: Group in a Warp: a `clip` rect doesn't stay a rect when warped; use a Mask with a shape instead");
+                }
+                let inner = acc * Affine::new(transform);
+                crate::warp::invertible(inner).map_err(|e| fail("Group", e))?;
+                Kind::Group { transform, clip, children: kids(children, inner, cx)? }
+            }
+            Kind::Mask { shape, invert, luminance, children } => {
+                Kind::Mask { shape: kids(shape, acc, cx)?, invert, luminance, children: kids(children, acc, cx)? }
+            }
+            Kind::Shape { geom, fill, stroke, even_odd } => {
+                for paint in fill.iter().chain(stroke.as_ref().map(|s| &s.paint)) {
+                    solid(paint).map_err(|e| fail("shape", e))?;
+                }
+                let path = crate::render::geom_path(&geom).map_err(|e| fail("shape", e))?;
+                let warped = |path: &BezPath, cx: &mut WarpCx| -> Result<String> {
+                    Ok((acc.inverse() * warp_path(&(acc * path.clone()), cx.map.as_mut(), cx.tol).map_err(|e| fail("shape", e))?).to_svg())
+                };
+                let shape = |d: String, fill, stroke, even_odd| Kind::Shape { geom: Geom::Path { d, transform: Affine::IDENTITY.as_coeffs() }, fill, stroke, even_odd };
+                match stroke {
+                    Some(s) if !cx.after => {
+                        // The stroke becomes an outline first, so its width follows the warp.
+                        // Only the centerline has to lie in `from`; the outline may overhang it.
+                        let centerline = warped(&path, cx)?;
+                        let outline = kurbo::stroke(path.iter(), &crate::render::kurbo_stroke(&s), &kurbo::StrokeOpts::default(), 1e-3);
+                        cx.map.lenient(true);
+                        let ring = warped(&outline, cx);
+                        cx.map.lenient(false);
+                        let ring = shape(ring?, Some(s.paint), None, false);
+                        let node = |kind| Node { kind, opacity: 1.0, blend: Blend::Normal, blur: 0.0, at: at.clone() };
+                        let mut parts = Vec::new();
+                        if fill.is_some() {
+                            parts.push(node(shape(centerline, fill, None, even_odd)));
+                        }
+                        parts.push(node(ring));
+                        Kind::Group { transform: Affine::IDENTITY.as_coeffs(), clip: None, children: parts }
+                    }
+                    stroke => shape(warped(&path, cx)?, fill, stroke, even_odd),
+                }
+            }
+            Kind::Text(t) => {
+                solid(&t.fill).map_err(|e| fail("Text", e))?;
+                let path = self.eng.fonts.borrow_mut().outline(&t).map_err(|e| fail("Text", e))?;
+                let d = (acc.inverse() * warp_path(&(acc * path), cx.map.as_mut(), cx.tol).map_err(|e| fail("Text", e))?).to_svg();
+                Kind::Shape { geom: Geom::Path { d, transform: Affine::IDENTITY.as_coeffs() }, fill: Some(t.fill), stroke: None, even_odd: false }
+            }
+            Kind::Image { .. } => bail!("{at}: Image in a Warp: warping pixels isn't supported; warp vector content, or place the image outside the Warp"),
+            Kind::Effect { effect, uniforms, area, inputs, children } => {
+                if area.is_some() {
+                    bail!("{at}: {effect} in a Warp: `area` is a rect and doesn't stay one when warped; set `area` on an effect outside the Warp");
+                }
+                let inputs = inputs.into_iter().map(|(k, n)| Ok((k, self.warp_node(n, acc, cx)?))).collect::<Result<_>>()?;
+                Kind::Effect { effect, uniforms, area, inputs, children: kids(children, acc, cx)? }
+            }
+            Kind::Sdf { range, fill, children } => Kind::Sdf { range, fill, children: kids(children, acc, cx)? },
+            Kind::Height { scale, children } => Kind::Height { scale, children: kids(children, acc, cx)? },
+        };
+        Ok(Node { kind, opacity, blend, blur, at })
     }
 
     fn node(&self, t: Table) -> Result<Node> {
@@ -1084,6 +1396,20 @@ impl Conv<'_> {
                     return Err(p.err("`range` must be positive"));
                 }
                 Kind::Sdf { range, fill: p.with("fill", color)?.unwrap_or([1.0; 4]), children: self.child_nodes(&p)? }
+            }
+            "Warp" => {
+                let mapv = p.raw("map")?.ok_or_else(|| {
+                    p.err("missing `map` (edgePatch {...}, bezierPatch {...}, along(d, {...}), or a function(x, y) returning x, y)")
+                })?;
+                let src = map_src(&mapv).map_err(|e| p.err(format!("map: {e:#}")))?;
+                let (from, extend, tol) = warp_opts(&p)?;
+                let after = p.choice("strokes", &[("after", true), ("warp", false)], true)?;
+                let children = self.child_nodes(&p)?;
+                p.finish()?;
+                let map = make_map(&src, from, extend).map_err(|e| p.err(e))?;
+                let mut cx = WarpCx { map, tol, after };
+                let children = children.into_iter().map(|n| self.warp_node(n, Affine::IDENTITY, &mut cx)).collect::<Result<_>>()?;
+                Kind::Group { transform: Affine::IDENTITY.as_coeffs(), clip: None, children }
             }
             "Canvas" => return Err(p.err("Canvas can only be the root (use rasterize() to nest a scene)")),
             other => return Err(p.err(format!("unknown element {other:?}"))),

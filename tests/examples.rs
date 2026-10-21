@@ -27,7 +27,7 @@ fn render(example: &str, extra: &[&str]) -> image::RgbaImage {
 
 #[test]
 fn all_examples_render() {
-    for ex in ["basics", "poster", "halftone", "a-grid", "dracula", "outline", "sdf", "field", "type", "transform", "logo", "refract"] {
+    for ex in ["basics", "poster", "halftone", "a-grid", "dracula", "outline", "sdf", "field", "type", "transform", "logo", "refract", "warp"] {
         render(ex, &[]);
     }
 }
@@ -494,5 +494,47 @@ fn height_inputs_are_explicit() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success() && err.contains(want), "{case}: {err}");
         assert!(err.contains("height_errors.luau:"), "{case}: no script location in {err}");
+    }
+}
+
+fn warp_case(case: &str) -> (PathBuf, Output) {
+    prisma("tests/fixtures/warp.luau", &["-p", &format!("case={case}")])
+}
+
+#[test]
+fn affine_warps_match_transforms() {
+    // A Coons patch on a parallelogram (from its outline or four edges) and a
+    // function map are all the same affine, so they must draw what a Group
+    // transform does, up to antialiasing at edges.
+    let want = render_script("tests/fixtures/warp.luau", &["-p", "case=grouped"]);
+    for case in ["warped", "edges", "fn"] {
+        let got = render_script("tests/fixtures/warp.luau", &["-p", &format!("case={case}")]);
+        let (mut worst, mut off) = (0u8, 0usize);
+        for (a, b) in got.pixels().zip(want.pixels()) {
+            let d = a.0.iter().zip(b.0.iter()).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
+            worst = worst.max(d);
+            off += (d > 8) as usize;
+        }
+        assert!(worst <= 96, "{case}: a pixel differs by {worst}");
+        assert!(off * 1000 < (want.width() * want.height()) as usize, "{case}: {off} pixels differ by more than 8");
+    }
+}
+
+#[test]
+fn warp_rules_reject() {
+    for (case, want) in [
+        ("outside", "is outside `from` { 0, 0, 50, 50 }: grow `from` to cover the content, or set outside = \"extend\""),
+        ("no_from", "Warp: missing `from = { x, y, w, h }`"),
+        ("fn_from", "a map function maps doc px directly, so it takes no `from`"),
+        ("image", "Image in a Warp: warping pixels isn't supported"),
+        ("gradient", "gradient paint can't follow a warp"),
+        ("clip", "a `clip` rect doesn't stay a rect when warped"),
+        ("corners", "the corners must lie around the outline in the order top-left, top-right, bottom-right, bottom-left"),
+        ("edges_apart", "the bottom-left (bottom's start, left's end) corner doesn't meet"),
+    ] {
+        let (_, out) = warp_case(case);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && err.contains(want), "{case}: {err}");
+        assert!(err.contains("warp.luau:"), "{case}: no script location in {err}");
     }
 }

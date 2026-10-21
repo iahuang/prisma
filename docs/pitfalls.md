@@ -62,6 +62,22 @@ surprised someone.
   their own centers. To rotate a shape about its center, put the shape at
   the origin inside a group positioned at the center.
 
+## Warp
+
+- **Patches need `from`; functions refuse it.** A patch's domain is the unit
+  square, so `from` names the rect of your content that fills it. A function
+  already maps doc px.
+- **Content outside `from` is an error by default**, naming the point.
+  Beads or caps that poke past the last row or column are the usual cause:
+  grow `from`, or pass `outside = "extend"`. Stroke overhang doesn't count.
+- **`strokeWidth` under `strokes = "after"` (the default) is doc px of the
+  result**, not of the content's units. Content drawn in a 27 × 5 grid
+  still takes `strokeWidth = 0.6` for a hairline.
+- Images, gradients, `Group.clip` and effect `area` can't be warped; each is
+  an error saying what to use instead.
+- A map function runs for many points per curve, during conversion. It
+  can't call `rasterize` or define effects; do that before the `Warp`.
+
 ## Big renders
 
 - An offscreen pass covers its output plus every pixel it reads: an

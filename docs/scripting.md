@@ -277,6 +277,69 @@ it's drawn at. Drawing more than 8192 device px of one image in one
 direction (say, a 12000 px tall page at full size into a 12000 px canvas)
 is an error that says so; crop it into pieces.
 
+### `Warp`
+
+Bends its children through a nonlinear map: lettering into a ribbon, a
+pattern into a logo's silhouette, type around a circle. Draw the content flat
+in whatever units suit it; `from` says which rect of it lands on the map.
+
+```lua
+local patch = edgePatch { outline = swoosh, corners = { tip, tail, tail, base } }
+Warp { map = patch, from = { 0, 0, 27, 5 },        -- the 27 x 5 grid -> the swoosh
+	Line { x1 = 0, y1 = 2.5, x2 = 27, y2 = 2.5, stroke = "#000", strokeWidth = 0.6 },
+	Ellipse { cx = 4, cy = 2.5, rx = 1.5, ry = 0.5 },
+}
+Warp { map = function(x, y) return x, y + 16 * math.sin(x / 40) end, Text { ... } }
+```
+
+| Prop | Default | Notes |
+| --- | --- | --- |
+| `map` | **required** | A patch (`edgePatch`, `bezierPatch`, `along`; below), or a Lua `function(x, y)` returning `x, y` in doc px |
+| `from` | — | `{ x, y, w, h }`: the rect of the children's coordinates that maps onto a patch's unit square (`x` → u, `y` → v, so the rect's top edge goes to the patch's top edge). **Required with a patch, an error with a function** (a function maps doc px itself). |
+| `strokes` | `"after"` | `after`: the centerline is warped and then stroked, so a `strokeWidth` is doc px of the result and hairlines stay hairlines. `warp`: the stroke is outlined first and the outline warped, so its width follows the distortion. |
+| `outside` | `"error"` | With a patch: what a point outside `from` does. `error` names the point; `extend` continues the patch past its edges along their end tangents. A stroke's overhang never counts, only its centerline. |
+| `tolerance` | `0.05` | Length. How far the warped curves may stray from the exact mapped ones. Fine to `--scale 4`; lower it for bigger renders. |
+
+How it works: each path is cut into cubics that follow the mapped curve within
+`tolerance`, so the result is ordinary path data: `--emit-ir` shows a `Group`
+of `Path`s, and crops, dumps and caching behave as for any shapes. Text
+becomes its glyph outlines. A `Group` inside keeps its transform: its content
+is warped in the `Warp`'s coordinates.
+
+What it can't take, each an error that says what to do instead:
+
+- `Image`: pixels aren't warped. Place the image outside the `Warp`.
+- Gradient `fill` or `stroke`: paint only follows affine transforms. Use the
+  warped shape as a `Mask` over the gradient.
+- `Group { clip }` and an effect's `area`: a rect doesn't stay a rect. Use a
+  `Mask`, or put the effect outside.
+
+`Mask`, `opacity`, `blend`, `blur`, effects and `Sdf` inside work as usual:
+their shapes are warped and the rest happens to the result.
+
+#### Patches
+
+A patch maps the unit square (u right, v down) onto a curved region. It's a
+value: build it once, use it in several `Warp`s and `warpPath` calls.
+
+| Constructor | Shape |
+| --- | --- |
+| `edgePatch { top, right, bottom, left }` | A Coons patch: the region between four curves, each path data or a list of `{x, y}` points. They run top: TL→TR, right: TR→BR, bottom: BL→BR, left: TL→BL, and must meet at the corners. |
+| `edgePatch { outline, corners = { tl, tr, br, bl } }` | The same, cut from one closed outline at the points nearest the four corners (in either direction around it). Two equal corners collapse that edge, as at a tail or a point. |
+| `bezierPatch { p1, ..., p16 }` | A bicubic mesh: 4 rows of 4 control points, top row first, each left to right |
+| `along(d, { width })` | A band `width` wide following path `d`: u runs along it, v across, with v = 0 on the left of travel (above, for a path going right) |
+
+`edgePatch` and `along` take `param = "arclength"` (default: u is the fraction of
+each edge's length) or `"uniform"` (the curves' own segment parameter).
+
+| Method | Returns |
+| --- | --- |
+| `patch:at(u, v)` | `x, y` |
+| `patch:frame(u, v)` | `{ x, y, ux, uy, vx, vy }`: the point and its derivatives along u and v. `Group { transform = { f.ux / w, f.uy / w, f.vx / h, f.vy / h, f.x, f.y } }` places something unwarped at (u, v), following the patch, for a `from` of size w × h. |
+
+`warpPath(d, map, { from, outside, tolerance })` warps path data and returns
+path data, with the same options as `Warp`.
+
 ### Effects, `Sdf` and `Height`
 
 These are elements too: `Halftone { cell = 9, ... children }`,
@@ -297,6 +360,8 @@ is a height map that only fills an effect's `"height"` input
 | `grid`, `hexGrid`, `sample`, `rasterize` | [procedural.md](procedural.md) |
 | `outline(Text {...})` | Glyph outlines as SVG path data for a `Path`: stroke it with `fill = "none"`, mask with it, or join it to a mark ([procedural.md](procedural.md#type-as-geometry-outline)) |
 | `transformPath(d, t)` | Path data moved through a placement, returned as absolute path data. `t` is a matrix `{ a, b, c, d, e, f }` or the keys a `Group` takes (`x y rotate scale`, or `transform`). See [Transforming path data](#transforming-path-data-transformpath-pathbounds) |
+| `edgePatch {...}`, `bezierPatch {...}`, `along(d, {...})` | Warp patches ([Warp](#warp)) |
+| `warpPath(d, map, opts)` | Path data bent through a patch or function, as path data ([Warp](#warp)) |
 | `pathBounds(d)` | `{ x, y, w, h }`, the tight bounds of path data (curves included), or `nil` for an empty path |
 | `measure(Text {...})` | Where the text's lines and ink land (below) |
 | `effect { ... }` | Define a shader effect ([effects.md](effects.md)) |

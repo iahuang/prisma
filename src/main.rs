@@ -6,6 +6,7 @@ mod render;
 mod script;
 mod text;
 mod units;
+mod warp;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};

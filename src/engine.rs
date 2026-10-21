@@ -2,6 +2,7 @@
 //! decoded images and materialized rasters. Watch mode and sweeps reuse one
 //! Engine, so everything here is a warm cache across renders.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -75,7 +76,8 @@ impl Raster {
 
 pub struct Engine {
     pub gpu: Gpu,
-    pub fonts: Fonts,
+    /// Behind a RefCell so script conversion (which only borrows the engine) can outline text.
+    pub fonts: RefCell<Fonts>,
     pub effects: Effects,
     /// Scripts may only read files under this directory (`--root`).
     pub base_dir: PathBuf,
@@ -96,7 +98,7 @@ impl Engine {
     pub fn new(base_dir: PathBuf) -> Result<Engine> {
         Ok(Engine {
             gpu: Gpu::new()?,
-            fonts: Fonts::new(),
+            fonts: RefCell::new(Fonts::new()),
             effects: Effects::default(),
             script_dir: base_dir.clone(),
             base_dir,
