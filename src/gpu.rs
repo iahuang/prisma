@@ -636,7 +636,7 @@ impl Gpu {
                 label: Some(&def.name),
                 source: wgpu::ShaderSource::Wgsl(def.module.as_str().into()),
             });
-            let pipeline = fullscreen_pipeline(&self.device, &pipeline_layout, &module, "gw_vs", "gw_fs", wgpu::TextureFormat::Rgba8Unorm);
+            let pipeline = fullscreen_pipeline(&self.device, &pipeline_layout, &module, "prisma_vs", "prisma_fs", wgpu::TextureFormat::Rgba8Unorm);
             self.effect_pipelines.insert(def.name.clone(), (def.module.clone(), pipeline));
         }
         let sys = Sys {

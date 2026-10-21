@@ -45,7 +45,7 @@
   are bound as textures 3, 4, ... and never composited through vello, since
   anything vello composites is RGBA8. The effect bind group layout depends
   on the number of inputs (`Gpu::effect_layout`). Each input's range rides at
-  the end of the `u` buffer (`gw_range_NAME`).
+  the end of the `u` buffer (`prisma_range_NAME`).
 - **The jump flood** (`SDF_WGSL` in `gpu.rs`) seeds partly covered contour
   pixels at a subpixel edge point (Gustavson & Strand's coverage-to-distance).
   A refine pass fits each seed's edge as the principal axis of its

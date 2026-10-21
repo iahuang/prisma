@@ -140,8 +140,8 @@ impl EffectDef {
             if uniforms.iter().any(|(u, ..)| u == n) {
                 bail!("effect {name:?}: {n:?} is both a uniform and an input");
             }
-            if RESERVED.contains(&n.as_str()) || n.starts_with("gw_") {
-                bail!("effect {name:?}: input name {n:?} is taken by the prelude (reserved: {}, and anything starting with gw_)", RESERVED.join(", "));
+            if RESERVED.contains(&n.as_str()) || n.starts_with("prisma_") {
+                bail!("effect {name:?}: input name {n:?} is taken by the prelude (reserved: {}, and anything starting with prisma_)", RESERVED.join(", "));
             }
         }
         let module = format!("{wgsl}\n{}", prelude(&uniforms, &inputs));
@@ -216,7 +216,7 @@ fn prelude(uniforms: &[(String, UType, UValue)], inputs: &[(String, InputKind)])
         fields += &format!("  {n}: f32,\n");
     }
     for (n, _) in inputs {
-        fields += &format!("  gw_range_{n}: f32,\n");
+        fields += &format!("  prisma_range_{n}: f32,\n");
     }
     if fields.is_empty() {
         fields = "  _unused: vec4f,\n".into();
@@ -245,22 +245,22 @@ struct SdfSample {
 
 // Per Sdf input NAME at texture BINDING; the texture covers the same rect as src.
 const SDF_ACCESSOR: &str = r#"
-@group(0) @binding(BINDING) var gw_in_NAME: texture_2d<f32>;
-fn gw_NAME_texel(i: vec2i) -> vec4f {
-  if (any(i < vec2i(0)) || any(i >= vec2i(sys.src_size))) { return vec4f(-u.gw_range_NAME, 0.0, 0.0, 0.0); }
-  return textureLoad(gw_in_NAME, i, 0);
+@group(0) @binding(BINDING) var prisma_in_NAME: texture_2d<f32>;
+fn prisma_NAME_texel(i: vec2i) -> vec4f {
+  if (any(i < vec2i(0)) || any(i >= vec2i(sys.src_size))) { return vec4f(-u.prisma_range_NAME, 0.0, 0.0, 0.0); }
+  return textureLoad(prisma_in_NAME, i, 0);
 }
 // (d, q - p, cover), bilinear.
-fn gw_NAME_raw(p: vec2f) -> vec4f {
+fn prisma_NAME_raw(p: vec2f) -> vec4f {
   let q = p - sys.src_origin - 0.5;
   let i = vec2i(floor(q));
   let f = q - floor(q);
-  let a = mix(gw_NAME_texel(i), gw_NAME_texel(i + vec2i(1, 0)), f.x);
-  let b = mix(gw_NAME_texel(i + vec2i(0, 1)), gw_NAME_texel(i + vec2i(1, 1)), f.x);
+  let a = mix(prisma_NAME_texel(i), prisma_NAME_texel(i + vec2i(1, 0)), f.x);
+  let b = mix(prisma_NAME_texel(i + vec2i(0, 1)), prisma_NAME_texel(i + vec2i(1, 1)), f.x);
   return mix(a, b, f.y);
 }
 fn NAME(p: vec2f) -> SdfSample {
-  let v = gw_NAME_raw(p);
+  let v = prisma_NAME_raw(p);
   var s: SdfSample;
   s.d = v.x;
   s.q = p + v.yz;
@@ -271,8 +271,8 @@ fn NAME(p: vec2f) -> SdfSample {
     s.n = select(-v.yz, v.yz, v.x >= 0.0) / l;
   } else {
     // On the contour itself (or where the field is flat): the distance gradient.
-    let g = vec2f(gw_NAME_raw(p + vec2f(1.0, 0.0)).x - gw_NAME_raw(p - vec2f(1.0, 0.0)).x,
-                  gw_NAME_raw(p + vec2f(0.0, 1.0)).x - gw_NAME_raw(p - vec2f(0.0, 1.0)).x);
+    let g = vec2f(prisma_NAME_raw(p + vec2f(1.0, 0.0)).x - prisma_NAME_raw(p - vec2f(1.0, 0.0)).x,
+                  prisma_NAME_raw(p + vec2f(0.0, 1.0)).x - prisma_NAME_raw(p - vec2f(0.0, 1.0)).x);
     let gl = length(g);
     s.n = select(vec2f(0.0), -g / gl, gl > 1e-4);
   }
@@ -283,12 +283,12 @@ fn NAME(p: vec2f) -> SdfSample {
 // interpolates the crossing. For crops to match full renders, the effect's reach
 // must cover maxd, as for any read of src.
 fn NAME_march(p: vec2f, dir: vec2f, maxd: f32) -> f32 {
-  let side = select(-1.0, 1.0, gw_NAME_raw(p).x >= 0.0);
+  let side = select(-1.0, 1.0, prisma_NAME_raw(p).x >= 0.0);
   var t = 0.0;
   var tp = 0.0;
   var dp = 0.0;
   for (var i = 0; i < 1024; i++) {
-    let d = gw_NAME_raw(p + dir * t).x * side; // > 0 while still on the starting side
+    let d = prisma_NAME_raw(p + dir * t).x * side; // > 0 while still on the starting side
     if (d <= 0.0) {
       if (t == 0.0) { return 0.0; }
       return min(tp + (t - tp) * dp / (dp - d), maxd);
@@ -314,13 +314,13 @@ struct Sys {
   _pad1: vec2f,
 }
 @group(0) @binding(0) var<uniform> sys: Sys;
-@group(0) @binding(1) var gw_src: texture_2d<f32>;
+@group(0) @binding(1) var prisma_src: texture_2d<f32>;
 @group(0) @binding(2) var<uniform> u: U;
 
 // Children texels are stored straight; everything the effect sees is premultiplied.
-fn gw_texel(i: vec2i) -> vec4f {
+fn prisma_texel(i: vec2i) -> vec4f {
   if (any(i < vec2i(0)) || any(i >= vec2i(sys.src_size))) { return vec4f(0.0); }
-  let c = textureLoad(gw_src, i, 0);
+  let c = textureLoad(prisma_src, i, 0);
   return vec4f(c.rgb * c.a, c.a);
 }
 
@@ -329,8 +329,8 @@ fn src(p: vec2f) -> vec4f {
   let q = p - sys.src_origin - 0.5;
   let i = vec2i(floor(q));
   let f = q - floor(q);
-  let a = mix(gw_texel(i), gw_texel(i + vec2i(1, 0)), f.x);
-  let b = mix(gw_texel(i + vec2i(0, 1)), gw_texel(i + vec2i(1, 1)), f.x);
+  let a = mix(prisma_texel(i), prisma_texel(i + vec2i(1, 0)), f.x);
+  let b = mix(prisma_texel(i + vec2i(0, 1)), prisma_texel(i + vec2i(1, 1)), f.x);
   return mix(a, b, f.y);
 }
 
@@ -365,12 +365,12 @@ fn fbm(p: vec2f) -> f32 {
   return 0.5 * vnoise(p) + 0.25 * vnoise(p * 2.03) + 0.125 * vnoise(p * 4.12) + 0.0625 * vnoise(p * 8.37);
 }
 
-@vertex fn gw_vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+@vertex fn prisma_vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
   let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
   return vec4f(uv * 2.0 - 1.0, 0.0, 1.0);
 }
 
-@fragment fn gw_fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+@fragment fn prisma_fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let c = clamp(effect(fc.xy + sys.dst_origin), vec4f(0.0), vec4f(1.0));
   return vec4f(min(c.rgb, vec3f(c.a)), c.a);
 }

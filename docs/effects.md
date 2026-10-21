@@ -144,7 +144,7 @@ of each input's children, grown by `grow` (or over `area`). An effect can
 therefore have no children and draw only from its inputs.
 
 Input names follow the uniform rules. They also can't match a uniform or a
-prelude name (`src`, `hash`, `fbm`, ...), or start with `gw_`.
+prelude name (`src`, `hash`, `fbm`, ...), or start with `prisma_`.
 
 ### Where an effect draws and reads: `grow`, `area` and `reach`
 
