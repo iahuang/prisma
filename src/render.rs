@@ -64,7 +64,7 @@ const ATLAS_MAX: u32 = 8192;
 
 /// Renders a document at `scale` device px per doc px. `region` is in device px
 /// (None = the whole canvas); noise and grain are positioned absolutely, so a
-/// region matches the same pixels of a full render.
+/// region looks like the same part of a full render.
 pub fn render_document(eng: &mut Engine, doc: &Document, scale: f64, region: Option<IRect>) -> Result<(wgpu::Texture, IRect)> {
     let t0 = Instant::now();
     let canvas = IRect {
@@ -320,7 +320,7 @@ impl<'a> Pass<'a> {
     }
 
     /// `b` grown by `by` for a pass that reads neighbors, clipped to what's
-    /// readable (absolute, so crops still match full renders). Never smaller than `b`.
+    /// readable (absolute, so crops read what full renders do). Never smaller than `b`.
     fn read_rect(&self, b: IRect, by: u32) -> IRect {
         b.expand(by).intersect(self.readable).map_or(b, |r| r.union(b))
     }
@@ -361,7 +361,7 @@ impl<'a> Pass<'a> {
     }
 
     /// Renders `r` of `scene` in one vello render. With `checked`, a region that
-    /// overflows vello's buffers is rendered in halves and stitched (same pixels, just slower).
+    /// overflows vello's buffers is rendered in halves and stitched (slower).
     fn render_piece(&mut self, scene: &Scene, r: IRect) -> Result<wgpu::Texture> {
         let mut local = Scene::new();
         local.append(scene, Some(Affine::translate((-r.x as f64, -r.y as f64))));

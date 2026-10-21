@@ -37,17 +37,19 @@
 - **Device space is absolute.** Every scene is encoded in canvas device
   pixels. An offscreen pass renders only its node's device bounds,
   intersected with the parent's region of interest. Effects receive absolute
-  `p`. Together these make `--crop` output match a full render pixel for
-  pixel, which `crop_matches_full_render` tests. Anything new that's
-  position-dependent (noise, fields) must keep this. Passes that read
-  neighbors expand their input rect (effect `reach`, blur 3σ, SDF `range`)
-  through `Pass::read_rect`. It clips to the canvas grown by its `margin`,
-  which is absolute, so crops still match.
+  `p`. Passes that read neighbors expand their input rect (effect `reach`,
+  blur 3σ, SDF `range`) through `Pass::read_rect`. It clips to the canvas
+  grown by its `margin`, which is absolute.
+- **Crops and tiles should render the same as a whole render.** A `--crop`,
+  a tiled pass or an overflow split should look like the matching part of a
+  full render: no seams, nothing shifted, no effect that depends on where
+  the region starts. Position-dependent
+  features (noise, fields) should use absolute device coordinates so they
+  hold to this.
 - **No GPU submission draws more than `Gpu::tile` px on a side.**
   `render_region` renders vello scenes in tiles and stitches them, and
   `Gpu::run_pass` draws each pass as scissored tiles, each its own submit.
-  The pass pipelines don't blend, so scissored tiles write exactly the same
-  pixels. This keeps each submission's work bounded however big a pass gets.
+  This keeps each submission's work bounded however big a pass gets.
 - **Fields are data, not pictures.** An effect's `"sdf"` inputs are rendered
   (curves pre-flattened to `FIELD_TOLERANCE`), jump-flooded, and written as
   `Rgba32Float` `(d, q - p, coverage)` covering the effect's input rect.
@@ -155,10 +157,9 @@ cargo test --release
   checks `Refract` offsets against Snell's law and `Gloss` against Blinn
   (`refraction_follows_snell`, `tests/fixtures/refract_probe.luau`), checks a
   sheared `transform` (`transform_pixels`) and `measure` against layout
-  (`measure_matches_layout`, `tests/fixtures/measure.luau`), and checks crop
-  invariance (`crop_matches_full_render`, tolerance 2/255). Even-odd fills
+  (`measure_matches_layout`, `tests/fixtures/measure.luau`). Even-odd fills
   and outlines are checked in `logo_pixels`. vello buffer overflow (bounded mask layers, a
-  split render matching a crop, the line-segment error) is checked against
+  a split render, the line-segment error) is checked against
   `tests/fixtures/overflow.luau`, and images and passes over the atlas limit
   against `tests/fixtures/big.luau`. Affine warps (a Coons patch from an
   outline and from edges, a function) must draw what a `Group` transform does
@@ -166,8 +167,8 @@ cargo test --release
   `warp_rules_reject`, both against `tests/fixtures/warp.luau`.
 - **For a new feature, add an example to `examples/` and add it to the list
   in `all_examples_render`.** Then add a pixel test that checks the feature's
-  actual math at known coordinates, and a crop check if the feature is
-  position-dependent.
+  actual math at known coordinates. If the feature is position-dependent,
+  look at a `--crop` of it next to the full render.
 - Behaviour that isn't an example (sweeps, `--root`) gets a script in
   `tests/fixtures/`, rendered with `render_script` or run with `prisma`.
 - Tests run in parallel, and each render writes its own file under

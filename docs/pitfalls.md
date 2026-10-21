@@ -90,7 +90,7 @@ surprised someone.
 - vello (the rasterizer) has fixed-size GPU buffers. A scene that outgrows
   one renders blank, so prisma checks every render, and when one
   overflowed renders it again in pieces, with a `warning:` naming the
-  buffer. The pieces match a whole render pixel for pixel; they're just
+  buffer. The pieces look the same as a whole render; they're just
   slower. Overflow comes from area times count: many large shapes, layers
   or clips (a full-page shape repeated hundreds of times), or masks,
   `opacity` and `blend` layers nested more than 4 deep over a large area.

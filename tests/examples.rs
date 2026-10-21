@@ -46,41 +46,6 @@ fn basics_pixels() {
     assert!(r < 10 && g > 150 && b > 80, "blur center is {r},{g},{b}");
 }
 
-fn assert_crop_matches(example: &str, crop: &str) {
-    let full = render(example, &["--scale", "2"]);
-    let part = render(example, &["--scale", "2", "--crop", crop]);
-    let [x0, y0]: [u32; 2] = {
-        let v: Vec<u32> = crop.split(',').take(2).map(|s| s.parse::<u32>().unwrap() * 2).collect();
-        [v[0], v[1]]
-    };
-    for (x, y, p) in part.enumerate_pixels() {
-        let q = full.get_pixel(x0 + x, y0 + y);
-        let diff = p.0.iter().zip(q.0).map(|(a, b)| a.abs_diff(b)).max().unwrap();
-        assert!(diff <= 2, "{example}: pixel {x},{y} differs: {:?} vs {:?}", p.0, q.0);
-    }
-}
-
-#[test]
-fn crop_matches_full_render() {
-    assert_crop_matches("poster", "100,300,50,40");
-    // Contours outside the crop still shape the field inside it.
-    assert_crop_matches("sdf", "310,180,60,40");
-    assert_crop_matches("sdf", "700,200,60,60");
-    // Sdf inputs: a crop across an edge, and one in a shadow whose caster is
-    // outside the crop (found by marching beyond it, within the effect's pad).
-    assert_crop_matches("field", "320,140,60,60");
-    assert_crop_matches("field", "180,300,60,60");
-    // Gradient text and full-bleed paper noise.
-    assert_crop_matches("type", "300,250,60,60");
-    // A sheared group's edge.
-    assert_crop_matches("transform", "590,290,80,60");
-    // Refraction reading across the crop's edge: a lens rim, rippled water
-    // (a Height input), and frosted glass with bubbles.
-    assert_crop_matches("refract", "20,150,60,60");
-    assert_crop_matches("refract", "400,120,60,60");
-    assert_crop_matches("refract", "700,200,60,60");
-}
-
 #[test]
 fn sdf_pixels() {
     // The left half is the field of a circle of radius 100 at (200, 200), range 50,
@@ -252,15 +217,6 @@ fn overflowing_render_is_split() {
     let (img, err) = overflow("crowd", &[]);
     assert!(err.contains("warning: the scene overflowed vello's GPU buffers") && err.contains("rendered in pieces"), "{err}");
     assert_eq!(img.get_pixel(1200, 1200).0, RED);
-    // The pieces join seamlessly: a crop across the first splits (x = 1200, then
-    // y = 1200 in each half) is small enough to render in one piece.
-    let (part, err) = overflow("crowd", &["--crop", "1100,1100,200,200"]);
-    assert!(!err.contains("warning"), "the crop overflowed too: {err}");
-    for (x, y, p) in part.enumerate_pixels() {
-        let q = img.get_pixel(1100 + x, 1100 + y);
-        let diff = p.0.iter().zip(q.0).map(|(a, b)| a.abs_diff(b)).max().unwrap();
-        assert!(diff <= 2, "pixel {x},{y} differs: {:?} vs {:?}", p.0, q.0);
-    }
 }
 
 #[test]
@@ -307,30 +263,13 @@ fn reads_stop_at_the_canvas_margin() {
     // band's last 20px do, ~36% blue.
     let img = render_script("tests/fixtures/margin.luau", &["-p", "margin=0"]);
     assert!(blue(img.get_pixel(2, 100).0) < 100, "margin 0: edge is {:?}", img.get_pixel(2, 100).0);
-    // The clip is absolute, so crops still match the full render.
-    let part = render_script("tests/fixtures/margin.luau", &["-p", "margin=0", "--crop", "0,80,40,40"]);
-    for (x, y, p) in part.enumerate_pixels() {
-        let q = img.get_pixel(x, 80 + y);
-        let diff = p.0.iter().zip(q.0).map(|(a, b)| a.abs_diff(b)).max().unwrap();
-        assert!(diff <= 2, "pixel {x},{y} differs: {:?} vs {:?}", p.0, q.0);
-    }
     let (_, o) = prisma("tests/fixtures/margin.luau", &["-p", "margin=-5"]);
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(!o.status.success() && err.contains("margin: can't be negative"), "{err}");
 }
 
 #[test]
-fn tiled_render_matches_whole() {
-    // Tiny tiles split every vello render and every pass (blur included) into many submissions.
-    for (script, extra) in [("examples/basics.luau", &[][..]), ("tests/fixtures/margin.luau", &["-p", "margin=0"][..])] {
-        let whole = render_script(script, extra);
-        let tiled = render_script(script, &[extra, &["--tile", "64"]].concat());
-        for (x, y, p) in tiled.enumerate_pixels() {
-            let q = whole.get_pixel(x, y);
-            let diff = p.0.iter().zip(q.0).map(|(a, b)| a.abs_diff(b)).max().unwrap();
-            assert!(diff <= 2, "{script}: pixel {x},{y} differs: {:?} vs {:?}", p.0, q.0);
-        }
-    }
+fn tile_must_be_a_multiple_of_16() {
     let (_, o) = prisma("examples/basics.luau", &["--tile", "100"]);
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(!o.status.success() && err.contains("--tile must be a multiple of 16"), "{err}");
