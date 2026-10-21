@@ -1,7 +1,5 @@
 # Prisma
 
-![Prisma logo](assets/logo.png)
-
 Prisma is a graphic design and digital illustration program for you and your coding agent. Design files are [Luau](https://luau.org/) scripts and the result is a procedurally generated, (largely) deterministic, precisely editable artifact rather than the result of rerolling a diffusion model.
 
 
