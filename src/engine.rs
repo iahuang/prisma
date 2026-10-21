@@ -18,7 +18,7 @@ use crate::render::render_document;
 use crate::text::Fonts;
 
 /// Bump when rendering changes in a way that invalidates cached rasters.
-const CACHE_VERSION: u32 = 6;
+const CACHE_VERSION: u32 = 7;
 
 /// Pixels materialized from a scene. Scripts read them (`r:at(x, y)`) and draw them (`Image { src = r }`).
 pub struct Raster {

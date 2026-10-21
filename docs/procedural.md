@@ -21,6 +21,7 @@ local field = rasterize(
 | `size` | **required** | `{ w, h }` doc size of the region, from (0, 0) in the scene's own coordinates |
 | `dpi` | `96` | Pixel density; 96 = 1 px per doc px. Lower is faster when you only sample coarsely. |
 | `bg` | transparent | Color |
+| `margin` | the larger of `size`'s sides | As `Canvas { margin }`: how far past `size` blur, effects and fields read |
 | `name` | none | With `--dump DIR`, the raster is written to `DIR/<name>.png` |
 
 `scene` is any element or list of elements (not a `Canvas`).

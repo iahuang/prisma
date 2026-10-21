@@ -39,7 +39,14 @@
   `p`. Together these make `--crop` output match a full render pixel for
   pixel, which `crop_matches_full_render` tests. Anything new that's
   position-dependent (noise, fields) must keep this. Passes that read
-  neighbors expand their input rect (effect `reach`, blur 3σ, SDF `range`).
+  neighbors expand their input rect (effect `reach`, blur 3σ, SDF `range`)
+  through `Pass::read_rect`. It clips to the canvas grown by its `margin`,
+  which is absolute, so crops still match.
+- **No GPU submission draws more than `Gpu::tile` px on a side.**
+  `render_region` renders vello scenes in tiles and stitches them, and
+  `Gpu::run_pass` draws each pass as scissored tiles, each its own submit.
+  The pass pipelines don't blend, so scissored tiles write exactly the same
+  pixels. This keeps each submission's work bounded however big a pass gets.
 - **Fields are data, not pictures.** An effect's `"sdf"` inputs are rendered
   (curves pre-flattened to `FIELD_TOLERANCE`), jump-flooded, and written as
   `Rgba32Float` `(d, q - p, coverage)` covering the effect's input rect. They

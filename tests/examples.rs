@@ -292,6 +292,46 @@ fn passes_bigger_than_the_atlas_draw() {
 }
 
 #[test]
+fn reads_stop_at_the_canvas_margin() {
+    let blue = |p: [u8; 4]| p[2] as i32 - p[0] as i32;
+    // By default the margin is the canvas's larger side: the band's off-canvas
+    // part still blurs in, ~82% blue 18px inside its edge (σ = 20).
+    let img = render_script("tests/fixtures/margin.luau", &[]);
+    assert!(blue(img.get_pixel(2, 100).0) > 130, "default margin: edge is {:?}", img.get_pixel(2, 100).0);
+    // With no margin, nothing left of the canvas exists to blur in: only the
+    // band's last 20px do, ~36% blue.
+    let img = render_script("tests/fixtures/margin.luau", &["-p", "margin=0"]);
+    assert!(blue(img.get_pixel(2, 100).0) < 100, "margin 0: edge is {:?}", img.get_pixel(2, 100).0);
+    // The clip is absolute, so crops still match the full render.
+    let part = render_script("tests/fixtures/margin.luau", &["-p", "margin=0", "--crop", "0,80,40,40"]);
+    for (x, y, p) in part.enumerate_pixels() {
+        let q = img.get_pixel(x, 80 + y);
+        let diff = p.0.iter().zip(q.0).map(|(a, b)| a.abs_diff(b)).max().unwrap();
+        assert!(diff <= 2, "pixel {x},{y} differs: {:?} vs {:?}", p.0, q.0);
+    }
+    let (_, o) = prisma("tests/fixtures/margin.luau", &["-p", "margin=-5"]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && err.contains("margin: can't be negative"), "{err}");
+}
+
+#[test]
+fn tiled_render_matches_whole() {
+    // Tiny tiles split every vello render and every pass (blur included) into many submissions.
+    for (script, extra) in [("examples/basics.luau", &[][..]), ("tests/fixtures/margin.luau", &["-p", "margin=0"][..])] {
+        let whole = render_script(script, extra);
+        let tiled = render_script(script, &[extra, &["--tile", "64"]].concat());
+        for (x, y, p) in tiled.enumerate_pixels() {
+            let q = whole.get_pixel(x, y);
+            let diff = p.0.iter().zip(q.0).map(|(a, b)| a.abs_diff(b)).max().unwrap();
+            assert!(diff <= 2, "{script}: pixel {x},{y} differs: {:?} vs {:?}", p.0, q.0);
+        }
+    }
+    let (_, o) = prisma("examples/basics.luau", &["--tile", "100"]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && err.contains("--tile must be a multiple of 16"), "{err}");
+}
+
+#[test]
 fn sdf_input_is_exact() {
     // Every tested pixel encodes its own errors against a true rotated square (see the fixture).
     for scale in ["1", "2"] {

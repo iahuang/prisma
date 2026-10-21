@@ -163,6 +163,9 @@ These are two separate settings:
   its inputs (default 0). Set it when the effect reads at an offset: a
   displacement, a neighbourhood, or a march's `maxd`. Reads past it come
   back transparent, and crops only match full renders for reads within it.
+  Reads also stop at the canvas's `margin` past its edge
+  ([scripting.md](scripting.md#canvas-root-only)). A huge `reach` near the
+  edge costs only what lies within it.
 
 Each is a fixed length or the name of a `length` uniform (`reach = "amount"`).
 Neither can be negative. The old `pad` set both; `pad = x` is now

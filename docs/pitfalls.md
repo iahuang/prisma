@@ -64,6 +64,13 @@ surprised someone.
 
 ## Big renders
 
+- An offscreen pass covers its output plus every pixel it reads: an
+  effect's `reach`, 3σ of blur, an `Sdf`'s `range`, all in device px (so
+  times `--scale`). A small `--crop` doesn't make that small. A 500 px
+  `reach` at `--scale 6` reads 3000 px around even a 60 × 40 crop, about
+  6000 × 6000 px of work. Reads stop at the canvas's `margin`, so a big
+  `reach` mostly costs what's on (or near) the canvas.
+
 - vello (the rasterizer) has fixed-size GPU buffers. A scene that outgrows
   one renders blank, so prisma checks every render, and when one
   overflowed renders it again in pieces, with a `warning:` naming the

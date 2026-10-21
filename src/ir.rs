@@ -10,6 +10,9 @@ use crate::units::Rgba;
 pub struct Document {
     pub size: [f64; 2],
     pub bg: Rgba,
+    /// Doc px beyond the canvas that blur, effects and distance fields can read
+    /// (None: the canvas's larger side).
+    pub margin: Option<f64>,
     pub children: Vec<Node>,
 }
 

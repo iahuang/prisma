@@ -194,13 +194,17 @@ fn install(lua: &Lua, eng: &Shared, deps: &Deps, opts: &RunOptions) -> Result<()
                 Some(c) => parse_color(&c).map_err(wrap)?,
                 None => [0.0; 4],
             };
+            let margin = match o.get::<Value>("margin")? {
+                Value::Nil => None,
+                v => Some(margin(&v).map_err(|err| wrap(err.context("margin")))?),
+            };
             let name = o.get::<Option<String>>("name")?;
             let doc = {
                 let eng = e.borrow();
                 let conv = Conv { eng: &eng, deps: &d };
                 let mut children = Vec::new();
                 conv.nodes(scene, &mut children).map_err(wrap)?;
-                Document { size, bg, children }
+                Document { size, bg, margin, children }
             };
             let mut eng = e.borrow_mut();
             let r = eng.rasterize(&doc, dpi).map_err(wrap)?;
@@ -475,6 +479,15 @@ fn length(v: &Value) -> Result<f64> {
     }
 }
 
+/// A canvas `margin`: a length, or `math.huge` for no limit.
+fn margin(v: &Value) -> Result<f64> {
+    let m = length(v)?;
+    if m < 0.0 {
+        bail!("can't be negative, got {m}");
+    }
+    Ok(m)
+}
+
 fn color(v: &Value) -> Result<Rgba> {
     match v {
         Value::String(s) => parse_color(&s.to_str()?),
@@ -727,12 +740,13 @@ impl Conv<'_> {
         let p = Props { at: t.raw_get::<Option<String>>("_at")?.unwrap_or_default(), op: "Canvas".into(), t, known: RefCell::default() };
         let size = p.with("size", point)?.ok_or_else(|| p.err("missing `size = {w, h}`"))?;
         let bg = p.with("bg", color)?.unwrap_or([1.0; 4]);
+        let margin = p.with("margin", margin)?;
         let mut children = Vec::new();
         for c in p.children()? {
             self.nodes(c, &mut children)?;
         }
         p.finish()?;
-        Ok(Document { size, bg, children })
+        Ok(Document { size, bg, margin, children })
     }
 
     /// Converts an element, or a list of them (nested lists flatten; nil/false are skipped).

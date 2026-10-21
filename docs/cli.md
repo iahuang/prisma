@@ -26,6 +26,7 @@ debug build is much slower on the CPU side.
 | `--profile` | — | Print GPU init, render size, offscreen pass count and timings to stderr |
 | `--root DIR` | script's directory | The only directory scripts may read from. Relative paths still resolve from the file they're written in, so `--root ..` lets a script reach `../photo.jpg`. |
 | `--timeout S` | `120` | Script wall-clock limit, including `rasterize` |
+| `--tile N` | `2048` | The most device px on a side that one GPU submission draws (a multiple of 16). Bigger renders and passes are drawn in tiles. Smaller tiles are slower: about +15% at 2048 and +55% at 1024 on a 2400×3400 render. |
 
 A successful run prints `wrote out/x.png (WxH, Nms; script Nms)`. An error
 prints `error: file.luau:LINE: Element: message` and exits with status 1.

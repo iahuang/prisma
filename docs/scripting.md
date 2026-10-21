@@ -79,6 +79,7 @@ box.
 | --- | --- | --- |
 | `size` | **required** | `{ w, h }`, lengths |
 | `bg` | `"#fff"` | Color; `"none"` for transparent |
+| `margin` | the larger of `w`, `h` | Length. How far past the canvas edge blur, effects and distance fields can read content. Anything farther out doesn't exist for them. `0` is the cheapest, and right when nothing off-canvas should show through. `math.huge` means no limit. |
 
 Children are the scene. `Canvas` can't be nested. To put one scene inside
 another, `rasterize` it ([procedural.md](procedural.md)).

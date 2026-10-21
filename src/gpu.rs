@@ -27,6 +27,23 @@ impl IRect {
         IRect { x: self.x - by as i32, y: self.y - by as i32, w: self.w + 2 * by, h: self.h + 2 * by }
     }
 
+    fn from_edges(x0: i32, y0: i32, x1: i32, y1: i32) -> IRect {
+        IRect { x: x0, y: y0, w: (x1 - x0) as u32, h: (y1 - y0) as u32 }
+    }
+
+    pub fn intersect(self, o: IRect) -> Option<IRect> {
+        let (x0, y0) = (self.x.max(o.x), self.y.max(o.y));
+        let (x1, y1) = ((self.x + self.w as i32).min(o.x + o.w as i32), (self.y + self.h as i32).min(o.y + o.h as i32));
+        (x1 > x0 && y1 > y0).then(|| IRect::from_edges(x0, y0, x1, y1))
+    }
+
+    /// The bounding rect of both.
+    pub fn union(self, o: IRect) -> IRect {
+        let (x0, y0) = (self.x.min(o.x), self.y.min(o.y));
+        let (x1, y1) = ((self.x + self.w as i32).max(o.x + o.w as i32), (self.y + self.h as i32).max(o.y + o.h as i32));
+        IRect::from_edges(x0, y0, x1, y1)
+    }
+
     /// Covers this with rects at most `size` on a side.
     pub fn tiles(self, size: u32) -> Vec<IRect> {
         let mut out = Vec::new();
@@ -118,10 +135,16 @@ impl std::fmt::Display for Overflow {
 
 impl std::error::Error for Overflow {}
 
+/// Default for [`Gpu::tile`].
+pub const DEFAULT_TILE: u32 = 2048;
+
 pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub vello: vello::Renderer,
+    /// The most device px on a side one GPU submission draws (`--tile`). Bigger
+    /// renders and passes go in tiles, each submitted on its own.
+    pub tile: u32,
     effect_pipelines: HashMap<String, (String, wgpu::RenderPipeline)>,
     blur_layout: wgpu::BindGroupLayout,
     blur_h: wgpu::RenderPipeline,
@@ -598,6 +621,7 @@ impl Gpu {
             device,
             queue,
             vello,
+            tile: DEFAULT_TILE,
             effect_pipelines: HashMap::new(),
             blur_layout,
             blur_h,
@@ -718,25 +742,33 @@ impl Gpu {
         )
     }
 
+    /// Draws a fullscreen pass into `target`, a scissored tile per submission (see [`Gpu::tile`]).
+    /// The pipelines don't blend, so each tile writes exactly what one whole draw would.
     fn run_pass(&self, pipeline: &wgpu::RenderPipeline, bind: &wgpu::BindGroup, target: &wgpu::Texture) {
         let view = target.create_view(&Default::default());
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
-                })],
-                ..Default::default()
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bind, &[]);
-            pass.draw(0..3, 0..1);
+        let whole = IRect { x: 0, y: 0, w: target.width(), h: target.height() };
+        for (i, t) in whole.tiles(self.tile).into_iter().enumerate() {
+            // A clear covers the whole target, not just the scissor: only the first tile may.
+            let load = if i == 0 { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { wgpu::LoadOp::Load };
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+                    })],
+                    ..Default::default()
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, bind, &[]);
+                pass.set_scissor_rect(t.x as u32, t.y as u32, t.w, t.h);
+                pass.draw(0..3, 0..1);
+            }
+            self.queue.submit([enc.finish()]);
         }
-        self.queue.submit([enc.finish()]);
     }
 
     /// The effect bind group layout for `fields` field inputs: sys, src, u, then one texture per field.

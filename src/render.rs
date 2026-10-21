@@ -36,6 +36,8 @@ pub struct Pass<'a> {
     fine: bool,
     scale: f64,
     resolution: [f32; 2],
+    /// The canvas grown by its `margin`: no pass reads beyond it.
+    readable: IRect,
     overrides: Vec<ImageData>,
     pub offscreen_passes: usize,
     dumped: usize,
@@ -75,8 +77,12 @@ pub fn render_document(eng: &mut Engine, doc: &Document, scale: f64, region: Opt
     if region.w > max || region.h > max {
         bail!("output {}x{} exceeds the GPU's {max}px texture limit (use --crop to render it in pieces)", region.w, region.h);
     }
+    // By default reads reach one canvas-length past the edge: content farther out
+    // rarely shows. Huge margins mean "unclipped"; the min keeps the arithmetic in range.
+    let margin = doc.margin.unwrap_or(doc.size[0].max(doc.size[1]));
+    let readable = canvas.expand((margin * scale).ceil().min(1e9) as u32);
     let attempt = |eng: &mut Engine, checked: bool| {
-        let mut pass = Pass::new(eng, scale, canvas, checked);
+        let mut pass = Pass::new(eng, scale, canvas, readable, checked);
         let result = pass.document(doc, canvas, region);
         pass.finish();
         (result, pass.offscreen_passes, pass.overflow, pass.splits)
@@ -253,12 +259,13 @@ fn kurbo_stroke(s: &Stroke) -> kurbo::Stroke {
 }
 
 impl<'a> Pass<'a> {
-    fn new(eng: &'a mut Engine, scale: f64, canvas: IRect, checked: bool) -> Pass<'a> {
+    fn new(eng: &'a mut Engine, scale: f64, canvas: IRect, readable: IRect, checked: bool) -> Pass<'a> {
         Pass {
             eng,
             fine: false,
             scale,
             resolution: [canvas.w as f32, canvas.h as f32],
+            readable,
             overrides: Vec::new(),
             offscreen_passes: 0,
             dumped: 0,
@@ -311,6 +318,12 @@ impl<'a> Pass<'a> {
         crate::engine::write_png(&dir.join(name), tex.width(), tex.height(), px)
     }
 
+    /// `b` grown by `by` for a pass that reads neighbors, clipped to what's
+    /// readable (absolute, so crops still match full renders). Never smaller than `b`.
+    fn read_rect(&self, b: IRect, by: u32) -> IRect {
+        b.expand(by).intersect(self.readable).map_or(b, |r| r.union(b))
+    }
+
     /// Builds one scene (one vello render's worth of drawing).
     fn scene(&mut self, f: impl FnOnce(&mut Self, &mut Scene) -> Result<()>) -> Result<Scene> {
         self.scene_images.push(HashMap::new());
@@ -332,9 +345,23 @@ impl<'a> Pass<'a> {
             .clone()
     }
 
-    /// Renders `r` of `scene`. With `checked`, a region that overflows vello's
-    /// buffers is rendered in halves and stitched (same pixels, just slower).
+    /// Renders `r` of `scene`, in tiles of at most `Gpu::tile` px on a side,
+    /// each its own vello render, stitched.
     fn render_region(&mut self, scene: &Scene, r: IRect) -> Result<wgpu::Texture> {
+        let tile = self.eng.gpu.tile;
+        if r.w <= tile && r.h <= tile {
+            return self.render_piece(scene, r);
+        }
+        let mut pieces = Vec::new();
+        for t in r.tiles(tile) {
+            pieces.push((t, self.render_piece(scene, t)?));
+        }
+        Ok(self.eng.gpu.stitch(r, &pieces))
+    }
+
+    /// Renders `r` of `scene` in one vello render. With `checked`, a region that
+    /// overflows vello's buffers is rendered in halves and stitched (same pixels, just slower).
+    fn render_piece(&mut self, scene: &Scene, r: IRect) -> Result<wgpu::Texture> {
         let mut local = Scene::new();
         local.append(scene, Some(Affine::translate((-r.x as f64, -r.y as f64))));
         let (tex, bump) = self.eng.gpu.render_scene(&local, r.w, r.h)?;
@@ -359,7 +386,7 @@ impl<'a> Pass<'a> {
         self.splits += 1;
         let mut pieces = Vec::new();
         for p in r.split() {
-            pieces.push((p, self.render_region(scene, p)?));
+            pieces.push((p, self.render_piece(scene, p)?));
         }
         Ok(self.eng.gpu.stitch(r, &pieces))
     }
@@ -422,7 +449,7 @@ impl<'a> Pass<'a> {
     /// The node blurred, as a premultiplied texture covering `b`.
     fn blurred(&mut self, n: &Node, xf: Affine, b: IRect) -> Result<wgpu::Texture> {
         let sigma = n.blur * scale_of(xf);
-        let c = b.expand((sigma * 3.0).ceil() as u32);
+        let c = self.read_rect(b, (sigma * 3.0).ceil() as u32);
         let scene = self.scene(|p, scene| {
             if !needs_pass(n) {
                 return p.encode_plain(scene, n, xf, irect(c), false);
@@ -465,7 +492,7 @@ impl<'a> Pass<'a> {
             Kind::Sdf { range, fill, children } => {
                 // Contours up to `range` outside the output still count, so render that much more.
                 let range_px = range * scale_of(xf);
-                let c = b.expand(range_px.ceil() as u32 + 1);
+                let c = self.read_rect(b, range_px.ceil() as u32 + 1);
                 let scene = self.field_scene(children, xf, c)?;
                 let input = self.render_region(&scene, c)?;
                 let color = [fill[0] * fill[3], fill[1] * fill[3], fill[2] * fill[3], fill[3]];
@@ -491,7 +518,7 @@ impl<'a> Pass<'a> {
     fn effect(&mut self, n: &Node, xf: Affine, b: IRect) -> Result<wgpu::Texture> {
         let Kind::Effect { effect, uniforms, inputs, children, .. } = &n.kind else { unreachable!() };
         let def = self.eng.effects.get(effect)?.clone();
-        let c = b.expand(def.reach_px(uniforms, self.scale).ceil() as u32);
+        let c = self.read_rect(b, def.reach_px(uniforms, self.scale).ceil() as u32);
         let scene = self.scene(|p, s| children.iter().try_for_each(|child| p.encode(s, child, xf, irect(c))))?;
         let input = self.render_region(&scene, c)?;
         // Field inputs cover the same rect as the children, so `body(p)` reads wherever `src(p)` does.
@@ -500,7 +527,7 @@ impl<'a> Pass<'a> {
             let Kind::Sdf { range, children, .. } = &node.kind else { unreachable!("inputs are checked to be Sdf elements") };
             let range_px = range * scale_of(xf);
             // Contours up to `range` outside the rect still count, as for a drawn Sdf.
-            let fc = c.expand(range_px.ceil() as u32 + 1);
+            let fc = self.read_rect(c, range_px.ceil() as u32 + 1);
             let scene = self.field_scene(children, xf, fc)?;
             let shape = self.render_region(&scene, fc)?;
             self.offscreen_passes += 1;

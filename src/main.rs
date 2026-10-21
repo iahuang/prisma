@@ -74,6 +74,9 @@ struct Cli {
     /// Script wall-clock limit in seconds (including rasterize calls).
     #[arg(long, default_value_t = 120)]
     timeout: u64,
+    /// The most device px on a side one GPU submission draws; bigger renders and passes go in tiles.
+    #[arg(long, default_value_t = gpu::DEFAULT_TILE)]
+    tile: u32,
 }
 
 fn main() {
@@ -96,8 +99,12 @@ fn real_main(cli: &Cli) -> Result<()> {
     }
     let out = cli.out.clone().unwrap_or_else(|| entry.with_extension(if cli.emit_ir { "json" } else { "png" }));
 
+    if cli.tile < 16 || !cli.tile.is_multiple_of(16) {
+        bail!("--tile must be a multiple of 16 (vello's tile size), got {}", cli.tile);
+    }
     let t0 = Instant::now();
     let mut eng = Engine::new(root)?;
+    eng.gpu.tile = cli.tile;
     eng.script_dir = dir.clone();
     eng.cache_dir = (!cli.no_cache).then(|| dir.join(".prisma-cache"));
     eng.dump_dir = cli.dump.clone();
@@ -277,6 +284,7 @@ fn sweep(cli: &Cli, eng: &Rc<RefCell<Engine>>, entry: &Path, out: &Path) -> Resu
     let sheet = Document {
         size: [PAD + cols as f64 * (CELL + PAD), PAD + rows as f64 * (CELL + LABEL + PAD)],
         bg: [0.9, 0.9, 0.9, 1.0],
+        margin: None,
         children: cells,
     };
     let mut e = eng.borrow_mut();
