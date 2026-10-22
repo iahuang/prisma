@@ -15,7 +15,7 @@ reading the Rust.
 | Write a pixel shader effect | [effects.md](effects.md): `effect { ... }`, WGSL helpers, built-in effects |
 | Bend content into a shape: type on a path, patterns in a silhouette | [scripting.md](scripting.md#warp): `Warp`, `edgePatch`, `along`, `bezierPatch`, `warpPath` |
 | Drive shapes from pixels (halftones, sampling, type as paths, distance fields) | [procedural.md](procedural.md): `rasterize`, `sample`, grids, `outline`, `Sdf`, randomness |
-| Animate: motion, particles, simulations, video output | [animation.md](animation.md): `Animation { fps, duration, init, step, frame }`, `rng`, checkpoints |
+| Animate: motion, particles, simulations, video output | [animation.md](animation.md): `Animation { fps, duration, init, step, frame }`, `rng`, easing, checkpoints |
 | Render, iterate, debug a render | [cli.md](cli.md): flags and the debugging loop |
 | Avoid the known traps | [pitfalls.md](pitfalls.md) |
 | Change prisma itself | [architecture.md](architecture.md): pipeline, module map, adding features, tests |

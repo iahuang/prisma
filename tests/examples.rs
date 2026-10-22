@@ -146,6 +146,12 @@ fn path_helpers_and_doc_coordinates() {
 }
 
 #[test]
+fn easing_curves() {
+    // The fixture asserts the prelude's ease* values; rendering it runs them.
+    render_script("tests/fixtures/ease.luau", &[]);
+}
+
+#[test]
 fn named_effects_can_change_between_runs() {
     // A sweep reuses one engine, like watch mode; each cell redefines "solid" with different code.
     let img = render_script("tests/fixtures/sweep_effect.luau", &["--sweep", "v=0.2,0.8"]);

@@ -65,6 +65,33 @@ function sample(r, pts)
 	return r:sample(pts)
 end
 
+-- ---- easing ----------------------------------------------------------------
+-- Curves from 0 to 1 over k in [0, 1]. k is clamped, so a time window is
+-- easeOut((t - start) / length). p is the power: 2 quad, 3 cubic, 5 quint.
+
+function easeIn(k: number, p: number?): number
+	return math.clamp(k, 0, 1) ^ (p or 3)
+end
+
+function easeOut(k: number, p: number?): number
+	return 1 - (1 - math.clamp(k, 0, 1)) ^ (p or 3)
+end
+
+function easeInOut(k: number, p: number?): number
+	k = math.clamp(k, 0, 1)
+	if k < 0.5 then
+		return (2 * k) ^ (p or 3) / 2
+	end
+	return 1 - (2 - 2 * k) ^ (p or 3) / 2
+end
+
+-- Overshoots and settles: crosses 1 `swings` + 1 times, the last at k = 1.
+-- Higher `damping` shrinks the overshoot.
+function easeSpring(k: number, swings: number?, damping: number?): number
+	k = math.clamp(k, 0, 1)
+	return 1 - math.cos(math.pi * ((swings or 2) + 0.5) * k) * math.exp(-(damping or 4) * k)
+end
+
 -- ---- standard effects ------------------------------------------------------
 
 Halftone = effect({

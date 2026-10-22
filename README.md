@@ -52,3 +52,7 @@ return Canvas { size = { W, H }, bg = BG,
 	Text { x = 530, y = 418, size = 24, font = "Courier New", tracking = 0.06, fill = "#8a8d98", "graphic design as code" },
 }
 ```
+
+```
+prisma assets/prism.luau -o assets/prism.gif
+```

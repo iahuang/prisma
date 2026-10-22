@@ -77,6 +77,27 @@ traits, and `rng("wander", n, i)` for per-step jitter. Without a
 simulation, particles can be computed in closed form: particle `i` is born
 at `i / rate`, keyed `rng(i)`, and placed by its age `t - born`.
 
+## Easing
+
+Curves that run from 0 to 1 as `k` goes from 0 to 1. `k` is clamped, so a
+time window needs no helper: `easeOut((t - start) / length)`. Map the result
+onto a value with `math.lerp(a, b, e)`.
+
+| Function | |
+| --- | --- |
+| `easeIn(k, p)` | `k ^ p`: starts slow. `p` defaults to 3 (cubic); 2 is quad, 5 quint, 1 linear. |
+| `easeOut(k, p)` | `1 - (1 - k) ^ p`: stops slow |
+| `easeInOut(k, p)` | `easeIn` over the first half, `easeOut` over the second |
+| `easeSpring(k, swings, damping)` | Overshoots, then settles. It crosses 1 `swings + 1` times (default 2), the last at `k = 1`, so it ends exactly on the target. `damping` (default 4) shrinks the overshoot: about 23% at the defaults. |
+
+```lua
+local x = math.lerp(80, 600, easeInOut((t - 0.5) / 1.2))   -- slides between 0.5s and 1.7s
+local s = 0.4 + 0.6 * easeSpring((t - 2) / 0.8)            -- pops in at 2s, landing at 2.8s
+```
+
+Anything else (a chain of segments, a custom curve) is ordinary Lua around
+these and `math.clamp`, `math.lerp` and `math.map`.
+
 ## Checkpoints
 
 The state is serialized every 30 frames, into memory and into

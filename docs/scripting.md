@@ -359,6 +359,7 @@ is a height map that only fills an effect's `"height"` input
 | `pick(list)` | A seeded random element |
 | `rng(key, ...)` | A random stream fixed by the seed and its keys, with `:float() :range(a, b) :int(a, b) :normal()` ([animation.md](animation.md#rngkey-)) |
 | `Animation { ... }` | Return it instead of a `Canvas` to animate ([animation.md](animation.md)) |
+| `easeIn`, `easeOut`, `easeInOut`, `easeSpring` | Easing curves from 0 to 1 over a clamped `k` ([animation.md](animation.md#easing)) |
 | `linear`, `radial` | Gradients (above) |
 | `grid`, `hexGrid`, `sample`, `rasterize` | [procedural.md](procedural.md) |
 | `outline(Text {...})` | Glyph outlines as SVG path data for a `Path`: stroke it with `fill = "none"`, mask with it, or join it to a mark ([procedural.md](procedural.md#type-as-geometry-outline)) |
