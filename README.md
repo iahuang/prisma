@@ -53,6 +53,4 @@ return Canvas { size = { W, H }, bg = BG,
 }
 ```
 
-```
-prisma assets/prism.luau -o assets/prism.gif
-```
+![A glass prism turning in a beam of white light](assets/prism.gif)
