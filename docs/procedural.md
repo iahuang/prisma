@@ -165,6 +165,9 @@ of a pixel, because that's where the alpha 0.5 contour of a drawn corner is.
 - `pick({ "#ff4b1f", "#2b50ff", "#00a35c" })` returns a random element.
 - To explore variations, run `--sweep seed=1..9`
   ([cli.md](cli.md#contact-sheets)).
+- `rng(key, ...)` gives a stream fixed by the seed and its keys, not by call
+  order: `rng("dot", i):range(0, 10)` is the same whatever ran before it.
+  Animations need this ([animation.md](animation.md#rngkey-)).
 - Effects can't see the Lua seed. To vary a noise effect with the seed, pass
   it as a uniform: `Displace { seed = random(0, 100), ... }`.
 

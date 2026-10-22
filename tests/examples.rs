@@ -30,6 +30,7 @@ fn all_examples_render() {
     for ex in ["basics", "poster", "halftone", "a-grid", "dracula", "outline", "sdf", "field", "type", "transform", "logo", "refract", "warp"] {
         render(ex, &[]);
     }
+    render("boids", &["--frame", "60", "-p", "boids=40"]);
 }
 
 #[test]
@@ -476,4 +477,69 @@ fn warp_rules_reject() {
         assert!(!out.status.success() && err.contains(want), "{case}: {err}");
         assert!(err.contains("warp.luau:"), "{case}: no script location in {err}");
     }
+}
+
+#[test]
+fn animation_time_is_exact() {
+    // Frame 5 at 10 fps is t = 0.5 s, so the bar is 10 px wide, however the frame is asked for.
+    for args in [&["--frame", "5"][..], &["--time", "0.5"], &["--time", "500ms"], &["--time", "5f"]] {
+        let img = render_script("tests/fixtures/anim.luau", args);
+        assert_eq!(img.get_pixel(9, 10).0, [0, 0, 0, 255], "{args:?}: inside the bar");
+        assert_eq!(img.get_pixel(10, 10).0, [255, 255, 255, 255], "{args:?}: past the bar");
+    }
+}
+
+#[test]
+fn animation_rules_reject() {
+    for (args, want) in [
+        (&["-p", "case=duration", "--frame", "0"][..], "0.15 is 1.500 frames at 10 fps, between frames 1 and 2"),
+        (&["-p", "case=state", "--frame", "0"], "s.tick is a function (state is plain data"),
+        (&["-p", "case=returns", "--frame", "1"], "step changes s in place and returns nothing"),
+        (&["--frame", "10"], "frame 10 is past the end: the animation has 10 frames (0..9)"),
+        (&["--time", "0.25"], "between frames 2 and 3"),
+        (&["--emit-ir"], "--emit-ir writes one scene"),
+    ] {
+        let (_, out) = prisma("tests/fixtures/anim.luau", args);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && err.contains(want), "{args:?}: {err}");
+    }
+    let (_, out) = prisma("examples/basics.luau", &["--frame", "0"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("need a script that returns an Animation"));
+}
+
+#[test]
+fn animation_checkpoints_match_a_continuous_run() {
+    // A copy of the example in its own directory, so its .prisma-cache starts empty.
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("anim-checkpoints");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("boids.luau");
+    std::fs::copy("examples/boids.luau", &script).unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_prisma")).arg(&script).args(["-p", "boids=40"]).args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    let seq = dir.join("seq");
+    run(&["--no-cache", "--frames", "0..45", "-o", &format!("{}/", seq.display())]);
+    // Frame 31 leaves checkpoints at 0 and 30; frame 45 then restores 30 and steps on.
+    run(&["--frame", "31", "-o", dir.join("a.png").to_str().unwrap()]);
+    let sims: Vec<_> = std::fs::read_dir(dir.join(".prisma-cache")).unwrap().map(|e| e.unwrap().path()).collect();
+    assert!(sims.len() == 1 && sims[0].join("30.state").exists(), "no checkpoint at frame 30 in {sims:?}");
+    run(&["--frame", "45", "-o", dir.join("b.png").to_str().unwrap()]);
+    let continuous = image::open(seq.join("0045.png")).unwrap().into_rgba8();
+    let restored = image::open(dir.join("b.png")).unwrap().into_rgba8();
+    assert!(continuous == restored, "frame 45 from a checkpoint differs from a continuous run");
+}
+
+#[test]
+fn onion_overlays_fading_ghosts() {
+    // Frames 2, 5, 8 put the dot at x = 4, 10, 16. The last is drawn as is; the
+    // ghost one frame back is 70% over the white background, two back 35%.
+    let img = render_script("tests/fixtures/anim.luau", &["-p", "case=dot", "--onion", "2..8/3"]);
+    let gray = |x| img.get_pixel(x, 10).0[0] as i32;
+    for (x, want) in [(0, 255), (5, 166), (11, 77), (17, 0)] {
+        assert!((gray(x) - want).abs() <= 2, "pixel {x} is {}, want {want}", gray(x));
+    }
+    let (_, out) = prisma("tests/fixtures/anim.luau", &["--onion", "2,5"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--onion needs at least 3 frames"));
 }

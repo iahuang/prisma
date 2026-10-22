@@ -1,7 +1,8 @@
 # Scripting reference
 
-A design file is a Luau script. It must return a `Canvas { ... }`, or a
-function that takes `params` and returns one.
+A design file is a Luau script. It must return a `Canvas { ... }`, an
+`Animation { ... }` ([animation.md](animation.md)), or a function that takes
+`params` and returns one of them.
 
 ```lua
 return Canvas { size = { 600, 850 }, bg = "#efebe2",
@@ -356,6 +357,8 @@ is a height map that only fills an effect's `"height"` input
 | `params` | The raw `-p k=v` values, all **strings** as typed (`-p id=007` gives `"007"`). Missing keys are `nil`. Prefer `param`. |
 | `random()`, `random(max)`, `random(min, max)` | Seeded uniform floats ([procedural.md](procedural.md#randomness)) |
 | `pick(list)` | A seeded random element |
+| `rng(key, ...)` | A random stream fixed by the seed and its keys, with `:float() :range(a, b) :int(a, b) :normal()` ([animation.md](animation.md#rngkey-)) |
+| `Animation { ... }` | Return it instead of a `Canvas` to animate ([animation.md](animation.md)) |
 | `linear`, `radial` | Gradients (above) |
 | `grid`, `hexGrid`, `sample`, `rasterize` | [procedural.md](procedural.md) |
 | `outline(Text {...})` | Glyph outlines as SVG path data for a `Path`: stroke it with `fill = "none"`, mask with it, or join it to a mark ([procedural.md](procedural.md#type-as-geometry-outline)) |

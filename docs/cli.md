@@ -17,9 +17,14 @@ debug build is much slower on the CPU side.
 | `--dpi D` | — | Same as `--scale D/96`. Can't be combined with `--scale`. |
 | `--crop x,y,w,h` | — | Render only this region, in **doc units** (`"400,120,240,300"` or `"10mm,10mm,50mm,30mm"`). The pixels match the same region of a full render, including noise and grain. |
 | `-p, --param k=v` | — | Sets a param (repeatable), read with `param("k", default)`. The value stays a string until `param` reads it as the default's type. |
-| `--sweep k=a,b,c` / `k=1..9` | — | Contact sheet over values (repeatable; the axes combine). `seed` sweeps seeds. |
+| `--sweep k=a,b,c` / `k=1..9` / `k=0..240/30` | — | Contact sheet over values (repeatable; the axes combine; `/s` steps a range). `seed` sweeps seeds, `frame` sweeps an Animation's frames. |
 | `--cols N` | √n | Contact sheet columns |
-| `--emit-ir` | — | Write the evaluated scene as JSON instead of rendering |
+| `--frame N` | — | Render one frame of an `Animation` (0-based) as a PNG |
+| `--time T` | — | The frame at a time: seconds, or `"1.5s"`, `"500ms"`, `"45f"`. It must land on a frame. |
+| `--frames A..B` | all | Render these frames (both ends included) to `-o` |
+| `--onion FRAMES` | — | Overlay an Animation's frames (`a..b/s` or `a,b,c`, at least 3) into one PNG: the last exactly, earlier ones as ghosts fading with age ([animation.md](animation.md#onion-skin)) |
+| `--encode ARGS` | — | ffmpeg output arguments replacing the defaults for `.mp4 .webm .mov .gif` |
+| `--emit-ir` | — | Write the evaluated scene as JSON instead of rendering (an `Animation` needs `--frame`) |
 | `--dump DIR` | — | Write every offscreen pass's input/output, plus every named `rasterize`, as PNGs |
 | `--no-cache` | — | Don't read or write `.prisma-cache/` |
 | `-w, --watch` | — | Re-render when the script or any file it read changes |
@@ -83,6 +88,28 @@ prisma examples/halftone.luau --sweep cell=5,9,14 --sweep seed=1,2 --cols 3
 
 Each variant runs in a fresh VM, sharing one GPU and one raster cache. Cells
 are 360 px, labeled `k=v`. `--scale` and `--crop` apply to every cell.
+
+## Animation
+
+A script returning `Animation { ... }` ([animation.md](animation.md)) renders
+every frame unless you pick one. `-o` chooses the output: a path ending in
+`/` (or an existing directory) gets a PNG sequence named by frame index,
+`.png` gets an APNG (the default, `<file>.png`), and `.mp4 .webm .mov .gif`
+are encoded by `ffmpeg`, which must be on PATH. Without it, the error prints
+the ffmpeg command to run on a PNG sequence yourself.
+
+```sh
+prisma examples/boids.luau --frame 120 --crop 300,200,200,150 --scale 3   # zoom into one frame
+prisma examples/boids.luau --sweep frame=0..225/45 --cols 3              # motion at a glance
+prisma examples/boids.luau --sweep seed=1..4 --frame 200                 # variations at one moment
+prisma examples/boids.luau --onion 130..150/4                            # paths and headings in one image
+prisma examples/boids.luau -o out/boids.mp4
+```
+
+A frame sweep plays the simulation once per seed and params, and visits
+frames in the order given. `--dump DIR` writes each frame's passes to
+`DIR/frame-NNNN/` when rendering several frames. `--crop`, `--scale` and `-p`
+apply to every frame.
 
 ## Limits
 

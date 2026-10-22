@@ -15,6 +15,7 @@ reading the Rust.
 | Write a pixel shader effect | [effects.md](effects.md): `effect { ... }`, WGSL helpers, built-in effects |
 | Bend content into a shape: type on a path, patterns in a silhouette | [scripting.md](scripting.md#warp): `Warp`, `edgePatch`, `along`, `bezierPatch`, `warpPath` |
 | Drive shapes from pixels (halftones, sampling, type as paths, distance fields) | [procedural.md](procedural.md): `rasterize`, `sample`, grids, `outline`, `Sdf`, randomness |
+| Animate: motion, particles, simulations, video output | [animation.md](animation.md): `Animation { fps, duration, init, step, frame }`, `rng`, checkpoints |
 | Render, iterate, debug a render | [cli.md](cli.md): flags and the debugging loop |
 | Avoid the known traps | [pitfalls.md](pitfalls.md) |
 | Change prisma itself | [architecture.md](architecture.md): pipeline, module map, adding features, tests |
@@ -58,4 +59,5 @@ that a design looks right. Only the render can tell you.
 | `examples/transform.luau` | `measure()`-driven layout (chained breadcrumb, pills fit to labels) placed with a sheared `transform` |
 | `examples/logo.luau` | A mark as one `Path` with `fillRule = "evenodd"` (holes without masks), and its construction drawn from the same path as outlines |
 | `examples/warp.luau` | `Warp` through each kind of map: a Coons ribbon, type `along` a circle (fit with `measure`), a `bezierPatch` flag with `strokes = "warp"`, a function |
+| `examples/boids.luau` | An `Animation` with a simulation: a flock in `step`, drawn as birds whose wings flap at a phase keyed by `rng` |
 | `examples/refract.luau` | Glass from parts: `Refract` and `Gloss` composed into a lens, water (a `Height` input drawn with noise) and bubbles in frosted glass |

@@ -1,3 +1,4 @@
+mod anim;
 mod effects;
 mod engine;
 mod gpu;
@@ -16,10 +17,11 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
+use crate::anim::{Player, Sink, frames_of, onion};
 use crate::engine::{Engine, write_png};
 use crate::gpu::IRect;
 use crate::ir::{Align, Anchor, Document, Fit, Font, ImageSrc, Kind, Node, Paint, Text};
-use crate::script::{RunOptions, run};
+use crate::script::{Loaded, RunOptions, load, run};
 use crate::units::parse_length;
 
 /// Graphic design as Luau. A script returns a `Canvas { ... }`; prisma
@@ -54,6 +56,21 @@ struct Cli {
     /// Contact sheet columns.
     #[arg(long)]
     cols: Option<usize>,
+    /// Render one frame of an Animation (0-based).
+    #[arg(long, conflicts_with_all = ["time", "frames"])]
+    frame: Option<u32>,
+    /// Render the Animation frame at this time: seconds, or e.g. "1.5s", "500ms", "45f".
+    #[arg(long, conflicts_with = "frames")]
+    time: Option<String>,
+    /// Render these frames of an Animation, a..b with both ends included (default: all).
+    #[arg(long, value_name = "A..B")]
+    frames: Option<String>,
+    /// Overlay these Animation frames into one PNG (a..b/s or a,b,c): the last as is, earlier ones as fading ghosts.
+    #[arg(long, value_name = "FRAMES", conflicts_with_all = ["frame", "time", "frames", "emit_ir"])]
+    onion: Option<String>,
+    /// ffmpeg output arguments replacing the defaults for -o .mp4/.webm/.mov/.gif.
+    #[arg(long, value_name = "ARGS", allow_hyphen_values = true)]
+    encode: Option<String>,
     /// Write the evaluated scene IR as JSON instead of rendering.
     #[arg(long)]
     emit_ir: bool,
@@ -174,14 +191,61 @@ fn crop_region(cli: &Cli) -> Result<Option<IRect>> {
     }))
 }
 
-fn evaluate(cli: &Cli, eng: &Rc<RefCell<Engine>>, entry: &Path, seed: u64, params: &[(String, String)]) -> Result<script::RunResult> {
-    let opts = RunOptions {
+fn options(cli: &Cli, seed: u64, params: &[(String, String)]) -> RunOptions {
+    RunOptions {
         seed,
         params: params.to_vec(),
         timeout: Duration::from_secs(cli.timeout),
         memory_limit: 2 << 30,
-    };
-    run(eng, entry, &opts)
+    }
+}
+
+fn evaluate(cli: &Cli, eng: &Rc<RefCell<Engine>>, entry: &Path, seed: u64, params: &[(String, String)]) -> Result<Document> {
+    run(eng, entry, &options(cli, seed, params))
+}
+
+/// `a,b,c`, `a..b` (both included) or `a..b/s` (every s-th).
+fn values(spec: &str) -> Result<Vec<String>> {
+    match spec.split_once("..") {
+        Some((a, b)) => {
+            let (b, step) = b.split_once('/').unwrap_or((b, "1"));
+            let (a, b, step): (i64, i64, usize) = (a.trim().parse()?, b.trim().parse()?, step.trim().parse()?);
+            if step == 0 {
+                bail!("the step after / must be at least 1");
+            }
+            Ok((a..=b).step_by(step).map(|v| v.to_string()).collect())
+        }
+        None => Ok(spec.split(',').map(|v| v.trim().to_string()).collect()),
+    }
+}
+
+/// Renders `--onion`'s frames and overlays them.
+fn onion_skin(cli: &Cli, eng: &Rc<RefCell<Engine>>, player: &mut Player, spec: &str) -> Result<(Vec<u8>, IRect)> {
+    let frames: Vec<u32> = values(spec)
+        .and_then(|vs| vs.iter().map(|v| v.parse::<u32>().map_err(|_| anyhow::anyhow!("{v:?} is not a frame number"))).collect())
+        .with_context(|| format!("--onion {spec}"))?;
+    let mut pixels = Vec::new();
+    let mut region = None;
+    for &f in &frames {
+        let doc = player.document(f)?;
+        let mut e = eng.borrow_mut();
+        let (tex, r) = render::render_document(&mut e, &doc, scale(cli), crop_region(cli)?).with_context(|| format!("frame {f}"))?;
+        if region.is_some_and(|r0: IRect| (r0.w, r0.h) != (r.w, r.h)) {
+            bail!("frame {f} is {}x{}, unlike frame {}: every frame's Canvas must be the same size", r.w, r.h, frames[0]);
+        }
+        region = Some(r);
+        pixels.push(e.gpu.read(&tex)?);
+    }
+    Ok((onion(&pixels)?, region.unwrap()))
+}
+
+/// The one frame `--frame` or `--time` asks for.
+fn one_frame(cli: &Cli, fps: u32) -> Result<Option<u32>> {
+    match (&cli.frame, &cli.time) {
+        (Some(f), _) => Ok(Some(*f)),
+        (_, Some(t)) => Ok(Some(frames_of(t, fps).context("--time")?)),
+        _ => Ok(None),
+    }
 }
 
 /// Renders the script once, returning the files it read.
@@ -194,15 +258,29 @@ fn render_once(
     params: &[(String, String)],
 ) -> Result<Vec<PathBuf>> {
     let t0 = Instant::now();
-    let res = evaluate(cli, eng, entry, seed, params)?;
+    let (session, loaded) = load(eng, entry, &options(cli, seed, params))?;
+    let doc = match loaded {
+        Loaded::Still(doc) => {
+            if cli.frame.is_some() || cli.time.is_some() || cli.frames.is_some() || cli.onion.is_some() {
+                bail!("--frame, --time, --frames and --onion need a script that returns an Animation {{ ... }}");
+            }
+            doc
+        }
+        Loaded::Anim(spec) => {
+            let cache = eng.borrow().cache_dir.clone();
+            let mut player = Player::new(session, spec, cache.as_deref())?;
+            let res = animate(cli, eng, &mut player, out, t0);
+            return res.map(|_| player.session.deps());
+        }
+    };
     let t_eval = t0.elapsed();
     if cli.emit_ir {
-        std::fs::write(out, serde_json::to_string_pretty(&res.doc)?)?;
+        std::fs::write(out, serde_json::to_string_pretty(&doc)?)?;
         println!("wrote {}", out.display());
-        return Ok(res.deps);
+        return Ok(session.deps());
     }
     let mut e = eng.borrow_mut();
-    let (tex, region) = render::render_document(&mut e, &res.doc, scale(cli), crop_region(cli)?)?;
+    let (tex, region) = render::render_document(&mut e, &doc, scale(cli), crop_region(cli)?)?;
     let pixels = e.gpu.read(&tex)?;
     write_png(out, region.w, region.h, pixels)?;
     println!(
@@ -213,7 +291,87 @@ fn render_once(
         t0.elapsed().as_secs_f64() * 1e3,
         t_eval.as_secs_f64() * 1e3
     );
-    Ok(res.deps)
+    Ok(session.deps())
+}
+
+/// Renders an Animation: one frame to a PNG (or IR), or a range of frames to a sink.
+fn animate(cli: &Cli, eng: &Rc<RefCell<Engine>>, player: &mut Player, out: &Path, t0: Instant) -> Result<()> {
+    let (fps, n) = (player.spec.fps, player.spec.frames);
+    if let Some(spec) = &cli.onion {
+        let (pixels, region) = onion_skin(cli, eng, player, spec)?;
+        write_png(out, region.w, region.h, pixels)?;
+        println!("wrote {} ({}x{}, onion of frames {spec}, {:.0}ms)", display(out), region.w, region.h, t0.elapsed().as_secs_f64() * 1e3);
+        return Ok(());
+    }
+    if let Some(f) = one_frame(cli, fps)? {
+        let t = Instant::now();
+        let doc = player.document(f)?;
+        let t_eval = t.elapsed();
+        if cli.emit_ir {
+            std::fs::write(out, serde_json::to_string_pretty(&doc)?)?;
+            println!("wrote {}", out.display());
+            return Ok(());
+        }
+        let mut e = eng.borrow_mut();
+        let (tex, region) = render::render_document(&mut e, &doc, scale(cli), crop_region(cli)?)?;
+        write_png(out, region.w, region.h, e.gpu.read(&tex)?)?;
+        println!(
+            "wrote {} ({}x{}, frame {f} at {:.3}s, {:.0}ms; script {:.0}ms)",
+            display(out),
+            region.w,
+            region.h,
+            f as f64 / fps as f64,
+            t0.elapsed().as_secs_f64() * 1e3,
+            t_eval.as_secs_f64() * 1e3
+        );
+        return Ok(());
+    }
+    if cli.emit_ir {
+        bail!("--emit-ir writes one scene: pick a frame with --frame N or --time T");
+    }
+    let (a, b) = match &cli.frames {
+        None => (0, n - 1),
+        Some(r) => {
+            let parsed = r.split_once("..").and_then(|(a, b)| Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?)));
+            match parsed {
+                Some((a, b)) if a <= b && b < n => (a, b),
+                Some(_) => bail!("--frames {r}: the animation has frames 0..{}", n - 1),
+                None => bail!("--frames wants a..b (both included), got {r:?}"),
+            }
+        }
+    };
+    let mut sink: Option<(Sink, u32, u32)> = None;
+    let mut t_eval = Duration::ZERO;
+    for f in a..=b {
+        let t = Instant::now();
+        let doc = player.document(f)?;
+        t_eval += t.elapsed();
+        let mut e = eng.borrow_mut();
+        if let Some(dir) = &cli.dump {
+            e.dump_dir = Some(dir.join(format!("frame-{f:04}")));
+        }
+        let (tex, region) = render::render_document(&mut e, &doc, scale(cli), crop_region(cli)?).with_context(|| format!("frame {f}"))?;
+        let pixels = e.gpu.read(&tex)?;
+        let (w, h) = (region.w, region.h);
+        if sink.is_none() {
+            sink = Some((Sink::open(out, w, h, fps, a, b - a + 1, cli.encode.as_deref())?, w, h));
+        }
+        let (s, w0, h0) = sink.as_mut().unwrap();
+        if (w, h) != (*w0, *h0) {
+            bail!("frame {f} is {w}x{h} but frame {a} was {w0}x{h0}: every frame's Canvas must be the same size");
+        }
+        s.push(f, w, h, pixels)?;
+    }
+    let (s, w, h) = sink.unwrap();
+    s.finish()?;
+    println!(
+        "wrote {} ({w}x{h}, {} frames at {fps} fps, {:.0}ms; script {:.0}ms)",
+        display(out),
+        b - a + 1,
+        t0.elapsed().as_secs_f64() * 1e3,
+        t_eval.as_secs_f64() * 1e3
+    );
+    Ok(())
 }
 
 fn display(p: &Path) -> String {
@@ -227,13 +385,7 @@ fn sweep(cli: &Cli, eng: &Rc<RefCell<Engine>>, entry: &Path, out: &Path) -> Resu
     let mut variants: Vec<Vec<(String, String)>> = vec![vec![]];
     for axis in &cli.sweep {
         let Some((k, vs)) = axis.split_once('=') else { bail!("--sweep wants k=a,b,c or k=1..9, got {axis:?}") };
-        let values: Vec<String> = match vs.split_once("..") {
-            Some((a, b)) => {
-                let (a, b): (i64, i64) = (a.parse()?, b.parse()?);
-                (a..=b).map(|v| v.to_string()).collect()
-            }
-            None => vs.split(',').map(String::from).collect(),
-        };
+        let values = values(vs).with_context(|| format!("--sweep {axis}"))?;
         variants = variants.iter().flat_map(|v| values.iter().map(move |x| [v.clone(), vec![(k.to_string(), x.clone())]].concat())).collect();
     }
 
@@ -244,15 +396,43 @@ fn sweep(cli: &Cli, eng: &Rc<RefCell<Engine>>, entry: &Path, out: &Path) -> Resu
     let rows = variants.len().div_ceil(cols);
     let mut cells = Vec::new();
     let t0 = Instant::now();
+    // Frames of one (seed, params) share a player, so its simulation runs once.
+    let mut player: Option<(u64, Vec<(String, String)>, Player)> = None;
     for (i, v) in variants.iter().enumerate() {
         let seed = v.iter().find(|(k, _)| k == "seed").map(|(_, s)| s.parse()).transpose()?.unwrap_or(cli.seed);
+        let frame = v.iter().find(|(k, _)| k == "frame").map(|(_, s)| s.parse::<u32>()).transpose()?;
         let mut params = base.clone();
-        params.extend(v.iter().filter(|(k, _)| k != "seed").cloned());
+        params.extend(v.iter().filter(|(k, _)| k != "seed" && k != "frame").cloned());
         let label = v.iter().map(|(k, x)| format!("{k}={x}")).collect::<Vec<_>>().join("  ");
-        let res = evaluate(cli, eng, entry, seed, &params).with_context(|| label.clone())?;
+        if frame.is_some() && cli.onion.is_some() {
+            bail!("--onion picks its own frames, so it can't be combined with a frame= sweep");
+        }
+        let animated = frame.is_some() || cli.frame.is_some() || cli.time.is_some() || cli.onion.is_some();
+        let doc = if animated {
+            if !matches!(&player, Some((s, p, _)) if *s == seed && *p == params) {
+                let (session, loaded) = load(eng, entry, &options(cli, seed, &params)).with_context(|| label.clone())?;
+                let Loaded::Anim(spec) = loaded else { bail!("frame sweeps and --frame need a script that returns an Animation {{ ... }}") };
+                let cache = eng.borrow().cache_dir.clone();
+                player = Some((seed, params.clone(), Player::new(session, spec, cache.as_deref())?));
+            }
+            let p = &mut player.as_mut().unwrap().2;
+            match (frame, &cli.onion) {
+                (Some(f), _) => Some(p.document(f).with_context(|| label.clone())?),
+                (None, Some(_)) => None,
+                (None, None) => Some(p.document(one_frame(cli, p.spec.fps)?.unwrap()).with_context(|| label.clone())?),
+            }
+        } else {
+            Some(evaluate(cli, eng, entry, seed, &params).with_context(|| label.clone())?)
+        };
+        let (pixels, region) = match doc {
+            Some(doc) => {
+                let mut e = eng.borrow_mut();
+                let (tex, region) = render::render_document(&mut e, &doc, scale(cli), crop_region(cli)?)?;
+                (e.gpu.read(&tex)?, region)
+            }
+            None => onion_skin(cli, eng, &mut player.as_mut().unwrap().2, cli.onion.as_deref().unwrap()).with_context(|| label.clone())?,
+        };
         let mut e = eng.borrow_mut();
-        let (tex, region) = render::render_document(&mut e, &res.doc, scale(cli), crop_region(cli)?)?;
-        let pixels = e.gpu.read(&tex)?;
         let size = [region.w as f64 / scale(cli), region.h as f64 / scale(cli)];
         let r = e.adopt_pixels(format!("sweep-{i}"), size, scale(cli) * 96.0, region.w, region.h, pixels);
         let k = (CELL / r.size[0]).min(CELL / r.size[1]);

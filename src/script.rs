@@ -10,7 +10,7 @@
 //! a wall-clock limit, and file access (require, images, fonts) confined to the
 //! project directory.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
@@ -21,6 +21,7 @@ use mlua::{Function, Lua, Table, UserData, UserDataFields, UserDataMethods, Valu
 use vello::kurbo::{self, Affine, BezPath, Point, Rect, Shape, Vec2};
 
 use crate::effects::{EffectDef, InputDef, InputKind, Margin, UType};
+use crate::anim::{Rng, Spec, key_bits, key_hash};
 use crate::engine::{Engine, Raster};
 use crate::ir::{Align, Anchor, Blend, Cap, Document, Fit, Font, Geom, ImageSrc, Join, Kind, Node, Paint, Stroke, Text, UValue};
 use crate::units::{Rgba, parse_color, parse_length};
@@ -28,7 +29,7 @@ use crate::warp::{Edge, Map, Patch, PatchMap, warp_path};
 
 const PRELUDE: &str = include_str!("prelude.luau");
 
-const PRIMITIVES: &[&str] = &["Canvas", "Group", "Mask", "Rect", "Circle", "Ellipse", "Line", "Path", "Text", "Image", "Sdf", "Height", "Warp"];
+const PRIMITIVES: &[&str] = &["Animation", "Canvas", "Group", "Mask", "Rect", "Circle", "Ellipse", "Line", "Path", "Text", "Image", "Sdf", "Height", "Warp"];
 
 pub struct RunOptions {
     pub seed: u64,
@@ -37,10 +38,52 @@ pub struct RunOptions {
     pub memory_limit: usize,
 }
 
-pub struct RunResult {
-    pub doc: Document,
-    /// Every file the run read, for watch mode.
-    pub deps: Vec<PathBuf>,
+/// What a script returned: one scene, or an animation to call back into frame by frame.
+pub enum Loaded {
+    Still(Document),
+    Anim(Spec),
+}
+
+/// A script's VM, kept alive after it returns so an animation can call into it.
+pub struct Session {
+    lua: Lua,
+    eng: Shared,
+    deps: Deps,
+    /// When the current call into the script started, for `--timeout`.
+    clock: Rc<Cell<Instant>>,
+    randomseed: Function,
+    seed: u64,
+    params: Vec<(String, String)>,
+}
+
+impl Session {
+    pub fn lua(&self) -> &Lua {
+        &self.lua
+    }
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+    pub fn params(&self) -> &[(String, String)] {
+        &self.params
+    }
+    /// Every file the script has read so far.
+    pub fn deps(&self) -> Vec<PathBuf> {
+        self.deps.borrow().iter().cloned().collect()
+    }
+    /// Restarts the `--timeout` clock: each call into the script gets the whole limit.
+    pub fn tick(&self) {
+        self.clock.set(Instant::now());
+    }
+    /// Reseeds `math.random` (and so `random`/`pick`) from the run's seed and `keys`.
+    pub fn reseed(&self, keys: &[u64]) -> Result<()> {
+        let h = crate::anim::key_hash(self.seed, keys.iter().copied());
+        self.randomseed.call::<()>((h >> 33) as f64).map_err(|e| anyhow!("{e}"))
+    }
+    /// A `Canvas` the script made, as IR.
+    pub fn document(&self, root: Value) -> Result<Document> {
+        let e = self.eng.borrow();
+        Conv { eng: &e, deps: &self.deps }.document(root)
+    }
 }
 
 type Shared = Rc<RefCell<Engine>>;
@@ -77,7 +120,16 @@ fn from_file(file: &str, rel: &str) -> PathBuf {
     out
 }
 
-pub fn run(eng: &Shared, entry: &Path, opts: &RunOptions) -> Result<RunResult> {
+/// Runs a script that must return a scene.
+pub fn run(eng: &Shared, entry: &Path, opts: &RunOptions) -> Result<Document> {
+    match load(eng, entry, opts)?.1 {
+        Loaded::Still(doc) => Ok(doc),
+        Loaded::Anim(_) => bail!("{} returns an Animation: pick a frame with --frame N or --time T", entry.display()),
+    }
+}
+
+/// Runs a script's top level and reads what it returned.
+pub fn load(eng: &Shared, entry: &Path, opts: &RunOptions) -> Result<(Session, Loaded)> {
     // Each run defines its effects afresh, so watch mode and sweeps see edited code.
     eng.borrow_mut().effects.defs.clear();
     let lua = Lua::new();
@@ -86,16 +138,17 @@ pub fn run(eng: &Shared, entry: &Path, opts: &RunOptions) -> Result<RunResult> {
     install(&lua, eng, &deps, opts)?;
     lua.load(PRELUDE).set_name("@prelude.luau").exec().map_err(|e| anyhow!("prelude: {e}"))?;
     lua.load(format!("math.randomseed({})", opts.seed)).exec()?;
+    let randomseed: Function = lua.globals().get::<Table>("math")?.get("randomseed")?;
     // Code loading and environment poking have no place in a design script.
     for name in ["loadstring", "getfenv", "setfenv"] {
         lua.globals().raw_set(name, Value::Nil)?;
     }
     lua.sandbox(true)?;
 
-    let start = Instant::now();
-    let timeout = opts.timeout;
+    let clock = Rc::new(Cell::new(Instant::now()));
+    let (timeout, started) = (opts.timeout, clock.clone());
     lua.set_interrupt(move |_| {
-        if start.elapsed() > timeout {
+        if started.get().elapsed() > timeout {
             return Err(mlua::Error::runtime(format!("script exceeded {}s (raise with --timeout)", timeout.as_secs())));
         }
         Ok(VmState::Continue)
@@ -108,13 +161,49 @@ pub fn run(eng: &Shared, entry: &Path, opts: &RunOptions) -> Result<RunResult> {
         let params: Value = lua.globals().get("params")?;
         root = f.call(params).map_err(|e| anyhow!("{e}"))?;
     }
-    let doc = {
-        let e = eng.borrow();
-        let conv = Conv { eng: &e, deps: &deps };
-        conv.document(root)?
+    let session = Session { lua, eng: eng.clone(), deps, clock, randomseed, seed: opts.seed, params: opts.params.clone() };
+    let loaded = match &root {
+        Value::Table(t) if t.raw_get::<Option<String>>("_op")?.as_deref() == Some("Animation") => Loaded::Anim(animation(t.clone())?),
+        _ => Loaded::Still(session.document(root)?),
     };
-    let deps = deps.borrow().iter().cloned().collect();
-    Ok(RunResult { doc, deps })
+    Ok((session, loaded))
+}
+
+/// Reads `Animation { fps, duration, substeps, init, step, frame }`.
+fn animation(t: Table) -> Result<Spec> {
+    let p = Props { at: t.raw_get::<Option<String>>("_at")?.unwrap_or_default(), op: "Animation".into(), t, known: RefCell::default() };
+    let fps = p.num("fps")?.ok_or_else(|| p.err("missing `fps` (frames per second, e.g. fps = 30)"))?;
+    if fps.fract() != 0.0 || !(1.0..=240.0).contains(&fps) {
+        return Err(p.err(format!("`fps` must be a whole number from 1 to 240, got {fps}")));
+    }
+    let fps = fps as u32;
+    let duration = p
+        .with("duration", |v| match v {
+            Value::Integer(_) | Value::Number(_) => crate::anim::frames_of(&number(v)?.to_string(), fps),
+            Value::String(s) => crate::anim::frames_of(&s.to_str()?, fps),
+            _ => bail!("expected seconds or a time like \"4s\", \"500ms\" or \"90f\", got {}", type_name(v)),
+        })?
+        .ok_or_else(|| p.err("missing `duration` (e.g. duration = \"4s\")"))?;
+    if duration == 0 {
+        return Err(p.err("`duration` must be at least one frame"));
+    }
+    let substeps = p.num("substeps")?.unwrap_or(1.0);
+    if substeps.fract() != 0.0 || !(1.0..=1000.0).contains(&substeps) {
+        return Err(p.err(format!("`substeps` must be a whole number from 1 to 1000, got {substeps}")));
+    }
+    let func = |k: &'static str| {
+        p.with(k, |v| match v {
+            Value::Function(f) => Ok(f.clone()),
+            _ => bail!("expected a function, got {}", type_name(v)),
+        })
+    };
+    let (init, step) = (func("init")?, func("step")?);
+    if init.is_some() != step.is_some() {
+        return Err(p.err("`init` and `step` go together: init() makes the state and step(s, dt, n) advances it"));
+    }
+    let frame = func("frame")?.ok_or_else(|| p.err("missing `frame = function(s, t, f) return Canvas { ... } end`"))?;
+    p.finish()?;
+    Ok(Spec { fps, frames: duration, substeps: substeps as u32, init, step, frame })
 }
 
 fn install(lua: &Lua, eng: &Shared, deps: &Deps, opts: &RunOptions) -> Result<()> {
@@ -163,6 +252,16 @@ fn install(lua: &Lua, eng: &Shared, deps: &Deps, opts: &RunOptions) -> Result<()
                 },
                 (Some(_), other) => fail(format!("the default must be a number, string or boolean, got {}", type_name(other))),
             }
+        })?,
+    )?;
+
+    // rng(key, ...): a random stream fixed by the seed and its keys, whatever order it's asked for in.
+    let seed = opts.seed;
+    g.set(
+        "rng",
+        lua.create_function(move |lua, keys: mlua::Variadic<Value>| {
+            let bits = keys.iter().map(key_bits).collect::<Result<Vec<_>>>().map_err(|err| lua_err(anyhow!("{}: {err:#}", caller(lua))))?;
+            Ok(Rng::new(key_hash(seed, bits)))
         })?,
     )?;
 
@@ -974,7 +1073,7 @@ struct Conv<'a> {
 impl Conv<'_> {
     fn document(&self, root: Value) -> Result<Document> {
         let Value::Table(t) = root else {
-            bail!("the script must return a Canvas {{ ... }} (or a function returning one), got {}", type_name(&root))
+            bail!("the script must return a Canvas {{ ... }} or an Animation {{ ... }} (or a function returning one), got {}", type_name(&root))
         };
         let op: Option<String> = t.raw_get("_op")?;
         if op.as_deref() != Some("Canvas") {
@@ -1412,6 +1511,7 @@ impl Conv<'_> {
                 Kind::Group { transform: Affine::IDENTITY.as_coeffs(), clip: None, children }
             }
             "Canvas" => return Err(p.err("Canvas can only be the root (use rasterize() to nest a scene)")),
+            "Animation" => return Err(p.err("Animation can only be what the script returns")),
             other => return Err(p.err(format!("unknown element {other:?}"))),
         };
         p.finish()?;

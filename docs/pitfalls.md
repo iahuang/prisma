@@ -157,9 +157,28 @@ surprised someone.
   files it reads. If you change something it can't see (only possible when
   developing prisma itself), use `--no-cache` or bump `CACHE_VERSION`.
 
+## Animation
+
+- **A frame changes when you clear the cache, or when you render it alone.**
+  Simulation state is being kept outside `s` (an upvalue or a table made
+  during setup and changed in `step`). Move it into the table `init`
+  returns ([animation.md](animation.md#the-contract)).
+- **Particles flicker or jump between frames.** They draw randomness from
+  `random()`, which is reseeded for every frame call. Key it by the particle
+  instead: `rng("size", i)`.
+- **A simulation diverges after a checkpoint.** It depends on `pairs` order
+  over a table's non-array keys. Iterate lists in order.
+- **`step` must change `s` in place.** Returning a new table is an error, and
+  assigning a new table to the parameter `s` silently does nothing. Change
+  its fields instead.
+- **Per-frame grain is costly in video.** `Grain { seed = f }` is new noise
+  every frame, which codecs can't predict, so files grow or turn to mush. A
+  fixed seed is static texture and compresses well.
+- `.mp4` and `.webm` need an even width and height at the rendered scale.
+
 ## Script structure
 
-- `Canvas` must be the returned root. To nest one, `rasterize` it and draw
+- `Canvas` (or `Animation`) must be the returned root. To nest one, `rasterize` it and draw
   the raster with `Image`.
 - Strings directly in children are an error (`stray text "..."`). Wrap them
   in `Text`.

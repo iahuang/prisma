@@ -5,13 +5,19 @@
       ──(script.rs: Conv)───────────────► IR (ir.rs, serde-serializable)
       ──(render.rs: Pass)───────────────► vello scenes + offscreen GPU passes (gpu.rs)
       ──(engine.rs)─────────────────────► RGBA8 ──► PNG
+                                                   └─(anim.rs: Sink)──► PNG sequence / APNG / ffmpeg
 ```
+
+An `Animation` keeps its VM alive (`script::Session`). `anim::Player` calls
+`frame` once per frame (`--onion` overlays several in pixels, `anim::onion`), and each call goes through the same `Conv` → render
+path as a still. Time never reaches the IR or `render.rs`.
 
 ## Module map
 
 | File | Owns |
 | --- | --- |
 | `src/main.rs` | CLI (clap), watch loop, `--sweep` contact sheets, `--crop`/`--scale` → device rect |
+| `src/anim.rs` | Animations: `Spec` (the `Animation` props), `Player` (live state, stepping, checkpoints in memory and `.prisma-cache/sim-<key>/`), state serialization (`encode`/`decode`: plain data only, exact f64 bits), keyed randomness (`key_hash`, `Rng` for `rng(...)`), `frames_of` (times to whole frames), and `Sink` (PNG sequence, APNG, or raw RGBA piped to ffmpeg with bt709 conversion) |
 | `src/script.rs` | Luau sandbox; installs globals (`PRIMITIVES` constructors, `params`, `param`, `effect`, `rasterize`, `outline`, `measure`, `require`); `Props` (prop reading + unknown-prop errors with edit-distance hints); `Conv` (tables → IR) |
 | `src/prelude.luau` | Lua-side helpers (`random`, `pick`, `linear`, `radial`, `grid`, `hexGrid`, `sample`) and the built-in effects, written as user code |
 | `src/ir.rs` | `Document`, `Node { kind, opacity, blend, blur, at }`, `Kind`, `Geom`, `Paint`, ... Everything in doc px and straight RGBA. |
@@ -112,6 +118,14 @@
   `Engine::fonts` is a `RefCell` (render takes `get_mut`). A Lua map
   function runs while that borrow is held, so `rasterize` and `effect` use
   `try_borrow_mut` and refuse to run inside one.
+- **A frame is a function of (seed, params, frame index).** Simulation state
+  is engine-owned plain data, stepped at a fixed `dt`, and checkpointed every
+  `CHECKPOINT_EVERY` frames. Restoring must give exactly the same state as
+  stepping continuously: serialization keeps f64 bits, and `math.random` is
+  reseeded before every `init`/`step`/`frame` call (`Session::reseed`). State
+  kept outside `s` is the script's problem (documented UB), not checked.
+  Bump `STATE_VERSION` in `anim.rs` when the checkpoint format or stepping
+  changes.
 - **Errors carry script locations.** Constructors record `_at` ("file:line").
   `Props::err` prefixes it, and render errors are wrapped with `Node::at`.
   Keep new errors in the form `file.luau:LINE: Element: what's wrong (how to
@@ -171,6 +185,12 @@ cargo test --release
   look at a `--crop` of it next to the full render.
 - Behaviour that isn't an example (sweeps, `--root`) gets a script in
   `tests/fixtures/`, rendered with `render_script` or run with `prisma`.
+- Animations: `animation_time_is_exact` (a bar that grows with `dt`, read
+  through `--frame` and every `--time` unit), `animation_rules_reject`
+  (`tests/fixtures/anim.luau`), and `animation_checkpoints_match_a_continuous_run`
+  (boids frame 45 restored from a disk checkpoint equals a continuous run,
+  byte for byte). `anim.rs` unit tests cover time parsing and the state
+  round trip.
 - Tests run in parallel, and each render writes its own file under
   `CARGO_TARGET_TMPDIR`.
 

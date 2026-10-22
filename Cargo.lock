@@ -1318,6 +1318,7 @@ dependencies = [
  "naga",
  "parlance",
  "parley",
+ "png",
  "pollster",
  "serde",
  "serde_json",
